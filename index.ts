@@ -25,8 +25,8 @@ const EMPTIED_ASSISTANT_TEXT = "[thinking removed]";
 
 /** Edits queued this turn. Pi persists them at the turn boundary, before the next request. */
 const pendingEditsBySession = new Map<string, ContextEdit[]>();
-/** Dry-run plans the agent can apply by ID without resending them. */
-const plansById = new Map<string, { sessionId: string; edits: ContextEdit[] }>();
+/** Dry-run plans the agent can apply by ID without resending them. They live in memory, so a reload clears them. */
+const plansById = new Map<string, { sessionId: string; edits: ContextEdit[]; breakdown: string }>();
 let planCount = 0;
 
 function isEditable(entry: SessionEntry): boolean {
@@ -254,6 +254,24 @@ function effectReport(base: SessionProjection, edited: SessionProjection, edits:
 	].join(" ");
 }
 
+/** @example operationLabel({ fold: "a1.c0", note: "x" }) === "fold a1.c0" */
+function operationLabel(operation: Operation): string {
+	if ("fold" in operation) return `fold ${operation.fold}`;
+	if ("dropThinking" in operation) return `dropThinking before ${operation.dropThinking.before}`;
+	return `${operation.replacement === null ? "remove" : "replace"} ${operation.id}`;
+}
+
+/** Tokens each operation frees when applied alone, so the agent can judge which ones are worth their cache cost. */
+function operationBreakdown(sessionManager: ReadonlySessionManager, queued: ContextEdit[], base: SessionProjection, operations: Operation[]): string {
+	if (operations.length < 2) return "";
+	const before = totalTokens(base);
+	const parts = operations.map((operation) => {
+		const alone = projectWithEdits(sessionManager, [...queued, ...compileOperations(base, [operation])]);
+		return `${operationLabel(operation)} ~${formatTokens(before - totalTokens(alone))}`;
+	});
+	return ` Per operation, each measured alone: ${parts.join("; ")}.`;
+}
+
 const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
@@ -276,7 +294,7 @@ const editContextTool = defineTool({
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
-		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, and confirms every tool call still has its result; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
+		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
 	parameters: Type.Object({
 		operations: Type.Optional(
@@ -299,23 +317,26 @@ const editContextTool = defineTool({
 		const base = projectWithEdits(sessionManager, queued);
 
 		let edits: ContextEdit[];
+		let breakdown: string;
 		if (parameters.apply !== undefined) {
 			const plan = plansById.get(parameters.apply);
-			if (!plan || plan.sessionId !== sessionId) throw new Error(`No dry-run plan ${parameters.apply} in this session`);
-			edits = plan.edits;
+			if (!plan || plan.sessionId !== sessionId) throw new Error(`No dry-run plan ${parameters.apply} in this session; plans are lost on reload, so run the dry run again`);
+			({ edits, breakdown } = plan);
 		} else {
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
-			edits = compileOperations(base, parameters.operations as Operation[]);
+			const operations = parameters.operations as Operation[];
+			edits = compileOperations(base, operations);
+			breakdown = operationBreakdown(sessionManager, queued, base, operations);
 		}
 
 		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const report = effectReport(base, edited, edits);
+		const report = effectReport(base, edited, edits) + breakdown;
 
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;
-			plansById.set(planId, { sessionId, edits });
+			plansById.set(planId, { sessionId, edits, breakdown });
 			return { content: [{ type: "text" as const, text: `Dry run, nothing applied. ${report} To apply exactly this, call edit_context with {"apply": "${planId}"}.` }] };
 		}
 		pendingEditsBySession.set(sessionId, [...queued, ...edits]);

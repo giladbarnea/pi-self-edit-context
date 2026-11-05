@@ -74,6 +74,14 @@ test("a dry run reports the effect without changing the context", () => {
 	assert.match(textOf(contextAfterEdit.find((message) => message.role === "user")), /ORIGINAL-REQUEST/);
 });
 
+test("a dry run of several operations reports what each frees on its own", () => {
+	const { contextAfterEdit, entries } = runAgent("dry-run-breakdown", "ORIGINAL-REQUEST: anything");
+	const report = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));
+	const first = messageEntries(entries, "assistant")[0].id;
+	// The first entry's thinking is 400 characters plus a 3,600-character signature: ~1.0k tokens.
+	assert.match(report, new RegExp(`Per operation, each measured alone: fold ${first}\\.c0 ~\\d+; dropThinking before \\w+ ~1\\.0k\\.`), `report: ${report}`);
+});
+
 test("applying a dry-run plan by its ID commits exactly that plan", () => {
 	const { contexts, contextAfterEdit, entries } = runAgent("dry-run-then-apply", "ORIGINAL-REQUEST: anything");
 	assert.match(textOf(contexts[0].find((message) => message.role === "user")), /ORIGINAL-REQUEST/, "the dry run changed the context");

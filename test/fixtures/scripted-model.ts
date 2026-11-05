@@ -69,6 +69,18 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	"dry-run-breakdown": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		outline,
+		(messages) => {
+			const [first] = assistantEntryIds(lastToolResultText(messages));
+			const latest = assistantEntryIds(lastToolResultText(messages)).at(-1)!;
+			return fauxAssistantMessage(
+				fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "n" }, { dropThinking: { before: latest } }], dryRun: true }),
+			);
+		},
+		record,
+	],
 	"drop-thinking": [
 		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
 		() => fauxAssistantMessage([signedThinking("THINK-B"), fauxToolCall("context_outline", {})]),
