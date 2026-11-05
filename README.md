@@ -4,7 +4,7 @@ Lets a Pi agent edit its own context window mid-run.
 
 ## `context_outline`
 
-Outlines the context as nested bullets. Each entry shows its ID, role, time, estimated tokens and first line. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. An entry's size is the sum of its blocks, signatures included, so the header total equals the sum of the lines.
+Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. An entry's size is the sum of its blocks, signatures included, so the header total equals the sum of the lines.
 
 ## `edit_context`
 

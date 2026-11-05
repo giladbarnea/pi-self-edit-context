@@ -161,20 +161,30 @@ function labelled(head: string, text: string): string {
 }
 
 function entryHead(entry: ProjectedEntry, label: string): string {
-	const parts = [`${entry.sourceEntry.id} ${label}`, entry.sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(entryTokens(entry))} tokens`];
+	const parts = [`${entry.sourceEntry.id} ${label}`, entry.sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(entryTokens(entry))} est.`];
 	if (!isEditable(entry.sourceEntry)) parts.push("not editable");
 	if (isEditable(entry.sourceEntry) && isEdited(entry)) parts.push("edited");
 	return parts.join(", ");
 }
 
+/** Pi's usage meter: the provider's count for the last response plus an estimate for what came after; null right after an edit until the next response. */
+type ContextUsage = { tokens: number | null } | undefined;
+
+/** @example meterLine({ tokens: 504480 }) === "Context: 504.5k tokens by Pi's usage meter." */
+function meterLine(usage: ContextUsage): string {
+	return usage?.tokens == null ? "Context: unknown until the next response, by Pi's usage meter." : `Context: ${formatTokens(usage.tokens)} tokens by Pi's usage meter.`;
+}
+
+const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use them to compare entries, not as real counts.";
+
 /** One bullet per entry; an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
-function outlineOf(projection: SessionProjection): string {
+function outlineOf(projection: SessionProjection, usage: ContextUsage): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
 	const removed = removedEntries(projection).length;
 	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
-	const lines = [`${visible.length} entries shown, ~${formatTokens(totalTokens(projection))} tokens total${removedNote}`];
+	const lines = [`${visible.length} entries shown, ~${formatTokens(totalTokens(projection))} est.${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}`];
 	for (const entry of visible) {
 		if (nestedResults.has(entry)) continue;
 		const message = entry.messages.at(-1)!;
@@ -187,7 +197,7 @@ function outlineOf(projection: SessionProjection): string {
 		const ids = blockIdsOf(entry);
 		message.content.forEach((block: Block, index: number) => {
 			const kind = block.type === "toolCall" ? "call" : ids[index].includes(".n") ? "note" : block.type;
-			const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} tokens`;
+			const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} est.`;
 			if (block.type === "thinking") lines.push(`  - ${head}${block.thinkingSignature ? ", signed" : ""}`);
 			else if (block.type === "toolCall") lines.push(`  - ${labelled(head, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
 			else lines.push(`  - ${labelled(head, block.text ?? "")}`);
@@ -205,7 +215,7 @@ function removedOutlineOf(projection: SessionProjection): string {
 	const lines = removed.map(({ sourceEntry }) => {
 		const content = originalContent(sourceEntry);
 		const role = sourceEntry.type === "message" ? sourceEntry.message.role : "custom";
-		const head = `${sourceEntry.id} ${role}, ${sourceEntry.timestamp.slice(5, 16).replace("T", " ")}, ~${formatTokens(contentTokens(content))} tokens`;
+		const head = `${sourceEntry.id} ${role}, ${sourceEntry.timestamp.slice(5, 16).replace("T", " ")}, ~${formatTokens(contentTokens(content))} est.`;
 		return `- ${labelled(head, textOf(content))}`;
 	});
 	return [`${removed.length} entr${removed.length === 1 ? "y" : "ies"} removed by edits; {"restore": id} brings one back:`, ...lines].join("\n");
@@ -336,8 +346,8 @@ function effectReport(base: SessionProjection, edited: SessionProjection, edits:
 	const before = totalTokens(base);
 	const after = totalTokens(edited);
 	return [
-		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
-		`Earliest change: ${visible[earliest].sourceEntry.id}, entry ${earliest + 1} of ${visible.length}; ~${formatTokens(reprocessed)} tokens from there on are reprocessed without the prompt cache once.`,
+		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} est. tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
+		`Earliest change: ${visible[earliest].sourceEntry.id}, entry ${earliest + 1} of ${visible.length}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
 		"Every tool call still has its result.",
 	].join(" ");
 }
@@ -365,14 +375,15 @@ const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
 	description: [
-		"Outline your current context window. Each entry is a bullet: entry ID, role, time, estimated tokens, and the first line of its text.",
+		"Outline your current context window. The header gives the real context size from Pi's usage meter; each entry is a bullet with its ID, role, time, estimated size, and the first line of its text.",
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
 	].join(" "),
 	parameters: Type.Object({ removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })) }),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
 		const projection = ctx.sessionManager.buildSessionProjection();
-		return { content: [{ type: "text" as const, text: parameters.removed ? removedOutlineOf(projection) : outlineOf(projection) }] };
+		const text = parameters.removed ? removedOutlineOf(projection) : outlineOf(projection, ctx.getContextUsage());
+		return { content: [{ type: "text" as const, text }] };
 	},
 });
 

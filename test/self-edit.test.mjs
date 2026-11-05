@@ -8,7 +8,7 @@ import { test } from "node:test";
 const root = new URL("..", import.meta.url).pathname;
 
 /** Run a real `pi -p` whose model is a scripted stand-in; return each context the model recorded and the session file. */
-function runAgent(script, prompt) {
+function runAgent(script, prompt, extraEnvironment = {}) {
 	const directory = mkdtempSync(join(tmpdir(), "self-edit-"));
 	const log = join(directory, "contexts.jsonl");
 	execFileSync(
@@ -16,7 +16,7 @@ function runAgent(script, prompt) {
 		["-p", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
 			"-e", join(root, "index.ts"), "-e", join(root, "test/fixtures/scripted-model.ts"),
 			"--model", "scripted/agent", "--session-dir", directory, prompt],
-		{ cwd: directory, env: { ...process.env, SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log }, stdio: "pipe" },
+		{ cwd: directory, env: { ...process.env, SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log, ...extraEnvironment }, stdio: "pipe" },
 	);
 	const sessionFile = readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl");
 	const contexts = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
@@ -44,18 +44,18 @@ test("the outline gives blocks their own IDs and sizes, and nests each tool resu
 	// The second outline call sees the first, two-call assistant entry and both of its results.
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries/.test(text)).at(-1);
 	assert.ok(outline, "no outline result reached the model");
-	assert.match(outline, /^\d+ entries shown, ~[\d.]+k? tokens total/, `outline header: ${outline.split("\n")[0]}`);
+	assert.match(outline, /^\d+ entries shown, ~[\d.]+k? est\./, `outline header: ${outline.split("\n")[0]}`);
 	const callEntry = messageEntries(entries, "assistant")[0];
 	const resultIds = messageEntries(entries, "toolResult").map((entry) => entry.id);
 	const lines = outline.split("\n");
 	const start = lines.findIndex((line) => line.startsWith(`- ${callEntry.id} assistant`));
 	// 400 characters of thinking plus a 3,600-character signature is ~1.0k tokens, and the entry total must include it.
 	const expected = [
-		new RegExp(`^- ${callEntry.id} assistant, .*, ~1\\.0k tokens$`),
-		new RegExp(`^  - ${callEntry.id}\\.t0 thinking, ~1\\.0k tokens, signed$`),
-		new RegExp(`^  - ${callEntry.id}\\.c0 call, ~\\d+ tokens: context_outline\\(\\{\\}\\)$`),
+		new RegExp(`^- ${callEntry.id} assistant, .*, ~1\\.0k est\\.$`),
+		new RegExp(`^  - ${callEntry.id}\\.t0 thinking, ~1\\.0k est\\., signed$`),
+		new RegExp(`^  - ${callEntry.id}\\.c0 call, ~\\d+ est\\.: context_outline\\(\\{\\}\\)$`),
 		new RegExp(`^    - ${resultIds[0]} result, `),
-		new RegExp(`^  - ${callEntry.id}\\.c1 call, ~\\d+ tokens: context_outline\\(\\{\\}\\)$`),
+		new RegExp(`^  - ${callEntry.id}\\.c1 call, ~\\d+ est\\.: context_outline\\(\\{\\}\\)$`),
 		new RegExp(`^    - ${resultIds[1]} result, `),
 	];
 	const block = lines.slice(start, start + expected.length);
@@ -63,12 +63,23 @@ test("the outline gives blocks their own IDs and sizes, and nests each tool resu
 	assert.equal(lines.filter((line) => line.includes(" result")).length, 2, "each result should appear once, nested under its call");
 });
 
+test("the outline header reports the context size from Pi's usage meter, not the character estimate", () => {
+	// The provider reports 400k prompt tokens while the messages are a few hundred characters,
+	// so an estimate-based header would say well under 1k.
+	const { contextAfterEdit } = runAgent("outline-then-dry-run", "ORIGINAL-REQUEST: anything", { SCRIPTED_MODEL_PROMPT_TOKENS: "400000" });
+	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries shown/.test(text)).at(-1);
+	const header = outline.split("\n")[0];
+	const meter = Number(header.match(/Context: ([\d.]+)k tokens by Pi's usage meter/)?.[1]);
+	assert.ok(meter >= 400 && meter < 410, `header should report about 400k from the meter: ${header}`);
+	assert.match(header, /estimates at ~4 characters per token/, `header should say entry sizes are estimates: ${header}`);
+});
+
 test("a dry run reports the effect without changing the context", () => {
 	const { contextAfterEdit, entries } = runAgent("outline-then-dry-run", "ORIGINAL-REQUEST: anything");
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a dry run persisted an edit");
 	const report = contextAfterEdit.findLast((message) => message.role === "toolResult");
 	assert.equal(report.isError, false);
-	for (const fact of [/Dry run, nothing applied/, /Frees ~[\d.]+k? tokens/, /Earliest change: \w+, entry \d+ of \d+; ~[\d.]+k? tokens from there on/, /Every tool call still has its result/, /"apply": "plan-\d+"/]) {
+	for (const fact of [/Dry run, nothing applied/, /Frees ~[\d.]+k? est\. tokens/, /Earliest change: \w+, entry \d+ of \d+; ~[\d.]+k? est\. tokens from there on/, /Every tool call still has its result/, /"apply": "plan-\d+"/]) {
 		assert.match(textOf(report), fact, `report: ${textOf(report)}`);
 	}
 	assert.match(textOf(contextAfterEdit.find((message) => message.role === "user")), /ORIGINAL-REQUEST/);
@@ -129,7 +140,7 @@ test("block IDs from an old outline still name the same blocks after an earlier 
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries shown/.test(text)).at(-1);
 	const lines = outline.split("\n");
 	assert.match(outline, /, 2 removed by edits/, `header: ${lines[0]}`);
-	assert.ok(lines.includes(`  - ${entry.id}.t0 thinking, ~1.0k tokens, signed`), `thinking should keep .t0:\n${outline}`);
+	assert.ok(lines.includes(`  - ${entry.id}.t0 thinking, ~1.0k est., signed`), `thinking should keep .t0:\n${outline}`);
 	assert.ok(lines.some((line) => line.startsWith(`  - ${entry.id}.n0 note, `) && line.endsWith(": FOLD-A")), `first note should be .n0:\n${outline}`);
 	assert.ok(lines.some((line) => line.startsWith(`- ${entry.id} assistant, `) && line.endsWith(", edited")), `the entry should be marked edited:\n${outline}`);
 });
@@ -148,7 +159,7 @@ test("restore brings a folded call back with its result, exactly as stored, and 
 	const lines = outline.split("\n");
 	assert.ok(!lines[0].includes("removed by edits") && !lines.some((line) => line.endsWith(", edited")), `after restore nothing should be marked edited or removed:\n${outline}`);
 	const restoreReport = textOf(contexts.at(-1).findLast((message) => message.role === "toolResult" && textOf(message).startsWith("Applied")));
-	assert.match(restoreReport, /Adds ~\d+ tokens/, `a restore grows the context and should say so: ${restoreReport}`);
+	assert.match(restoreReport, /Adds ~\d+ est\. tokens/, `a restore grows the context and should say so: ${restoreReport}`);
 });
 
 test("restoring an entry that was never edited is refused instead of breaking the cache for nothing", () => {

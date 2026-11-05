@@ -157,8 +157,18 @@ const scripts: Record<string, ScriptStep[]> = {
 	],
 };
 
+/** The faux provider estimates usage from characters; a script can instead report a fixed provider count, as a real provider would. */
+const reportedPromptTokens = process.env.SCRIPTED_MODEL_PROMPT_TOKENS;
+
 export default function (pi: ExtensionAPI): void {
-	const faux = fauxProvider({ provider: "scripted", models: [{ id: "agent" }] });
+	if (reportedPromptTokens) {
+		pi.on("message_end", (event) => {
+			if (event.message.role !== "assistant") return;
+			const usage = { ...event.message.usage, input: 0, cacheRead: Number(reportedPromptTokens), cacheWrite: 0 };
+			return { message: { ...event.message, usage: { ...usage, totalTokens: usage.cacheRead + usage.output } } };
+		});
+	}
+	const faux = fauxProvider({ provider: "scripted", models: [{ id: "agent", contextWindow: 1_000_000 }] });
 	faux.setResponses(scripts[scriptName].map((step) => (context: any) => step(context.messages)));
 	pi.registerProvider(faux.provider);
 }
