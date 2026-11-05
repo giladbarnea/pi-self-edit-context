@@ -36,6 +36,18 @@ const scripts: Record<string, ScriptStep[]> = {
 			return fauxAssistantMessage("done");
 		},
 	],
+	"outline-then-dry-run": [
+		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		(messages) => {
+			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { edits: [{ id, replacement: "short" }], dryRun: true }));
+		},
+		(messages) => {
+			recordContext(messages);
+			return fauxAssistantMessage("done");
+		},
+	],
 	"orphan-tool-results": [
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		(messages) => {

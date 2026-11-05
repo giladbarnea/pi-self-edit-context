@@ -38,6 +38,26 @@ test("an edit the agent makes applies to its very next request in the same run",
 	assert.ok(entries.some((entry) => entry.type === "context_edit" && entry.targetId === storedUser.id), "no context_edit entry was persisted");
 });
 
+test("the outline gives a total and pairs each tool result with the entry holding its call", () => {
+	const { contextAfterEdit, entries } = runAgent("outline-then-dry-run", "ORIGINAL-REQUEST: anything");
+	// The second outline call sees the first call and its result.
+	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries/.test(text)).at(-1);
+	assert.match(outline, /^\d+ entries, ~\d+ tokens total/, `outline header: ${outline.split("\n")[0]}`);
+	const callEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+	assert.ok(outline, "no outline result reached the model");
+	const resultLine = outline.split("\n").find((line) => line.includes(" toolResult "));
+	assert.ok(resultLine?.includes(`answers ${callEntry.id}`), `result line should name call entry ${callEntry.id}: ${resultLine}`);
+});
+
+test("a dry run reports the outcome without changing the context", () => {
+	const { contextAfterEdit, entries } = runAgent("outline-then-dry-run", "ORIGINAL-REQUEST: anything");
+	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a dry run persisted an edit");
+	const report = contextAfterEdit.findLast((message) => message.role === "toolResult");
+	assert.equal(report.isError, false);
+	assert.match(textOf(report), /dry run/i, `report: ${textOf(report)}`);
+	assert.match(textOf(contextAfterEdit.find((message) => message.role === "user")), /ORIGINAL-REQUEST/);
+});
+
 test("an edit that would separate tool calls from their results is refused and changes nothing", () => {
 	const { contextAfterEdit, entries } = runAgent("orphan-tool-results", "ORIGINAL-REQUEST: anything");
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a broken edit was persisted");

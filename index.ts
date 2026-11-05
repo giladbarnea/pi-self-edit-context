@@ -13,7 +13,7 @@ import {
 type ContextEdit = { targetId: string; replacement: ContextEditEntry["replacement"] };
 
 const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", "compactionSummary"]);
-const PREVIEW_CHARACTERS = 100;
+const PREVIEW_CHARACTERS = 200;
 
 /** Edits the agent has made this turn. Pi persists them at the turn boundary, before the next request. */
 const pendingEditsBySession = new Map<string, ContextEdit[]>();
@@ -28,10 +28,21 @@ function textOf(content: unknown): string {
 	return content.map((block) => (block.type === "text" ? block.text : block.type === "toolCall" ? `→ ${block.name}(${JSON.stringify(block.arguments)})` : "")).join(" ");
 }
 
-/** @example previewOf("first line\nsecond") === "first line" */
+/** @example blockSummary([{ type: "thinking" }, { type: "text" }, { type: "toolCall" }, { type: "toolCall" }]) === "[thinking+text+2 calls]" */
+function blockSummary(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	const calls = content.filter((block) => block.type === "toolCall").length;
+	const kinds = [...new Set(content.map((block) => block.type).filter((type) => type !== "toolCall"))];
+	if (calls > 0) kinds.push(calls === 1 ? "1 call" : `${calls} calls`);
+	return kinds.length > 1 ? `[${kinds.join("+")}]` : "";
+}
+
+/** @example previewOf("first line\nsecond") === "first line"; previewOf("a".repeat(150) + "b".repeat(150)) === "a".repeat(98) + "[…]" + "b".repeat(99) */
 function previewOf(text: string): string {
 	const firstLine = text.trim().split("\n")[0];
-	return firstLine.length > PREVIEW_CHARACTERS ? `${firstLine.slice(0, PREVIEW_CHARACTERS)}…` : firstLine;
+	if (firstLine.length <= PREVIEW_CHARACTERS) return firstLine;
+	const kept = (PREVIEW_CHARACTERS - "[…]".length) / 2;
+	return `${firstLine.slice(0, Math.floor(kept))}[…]${firstLine.slice(-Math.ceil(kept))}`;
 }
 
 /** The projection Pi would build after appending the edits, through Pi's own validation, as its turn boundary does. */
@@ -73,19 +84,30 @@ const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
 	description:
-		"List the messages in your current context window, one line each: entry ID, role, estimated tokens, and the first line of text. Use the IDs with edit_context.",
+		"List the messages in your current context window, one line each: entry ID, role, time, estimated tokens, block kinds, the call entry a tool result answers, and the first line of text. Use the IDs with edit_context.",
 	parameters: Type.Object({}),
 	async execute(_toolCallId, _parameters, _signal, _onUpdate, ctx) {
-		const lines = ctx.sessionManager
-			.buildSessionProjection()
-			.entries.filter(({ messages }) => messages.length > 0)
-			.map(({ sourceEntry, messages }) => {
-				const tokens = messages.reduce((total, message) => total + estimateTokens(message), 0);
-				const role = messages.at(-1)!.role;
-				const locked = isEditable(sourceEntry) ? "" : " [not editable]";
-				return `${sourceEntry.id} ${role} ~${tokens}tok${locked} ${previewOf(textOf(messages.at(-1)!.content))}`;
-			});
-		return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+		const projection = ctx.sessionManager.buildSessionProjection();
+		const visible = projection.entries.filter(({ messages }) => messages.length > 0);
+		const callEntryByCallId = new Map<string, string>();
+		const lines = visible.map(({ sourceEntry, messages }) => {
+			const message = messages.at(-1)!;
+			if (message.role === "assistant") for (const block of message.content) if (block.type === "toolCall") callEntryByCallId.set(block.id, sourceEntry.id);
+			const tokens = messages.reduce((total, part) => total + estimateTokens(part), 0);
+			const fields = [
+				sourceEntry.id,
+				message.role,
+				sourceEntry.timestamp.slice(5, 16).replace("T", " "),
+				`~${tokens}tok`,
+				isEditable(sourceEntry) ? "" : "[not editable]",
+				blockSummary(message.content),
+				message.role === "toolResult" ? `answers ${callEntryByCallId.get(message.toolCallId) ?? "?"}` : "",
+				previewOf(textOf(message.content)),
+			];
+			return fields.filter(Boolean).join(" ");
+		});
+		const header = `${visible.length} entries, ~${tokensOf(projection)} tokens total`;
+		return { content: [{ type: "text" as const, text: [header, ...lines].join("\n") }] };
 	},
 });
 
@@ -105,6 +127,7 @@ const editContextTool = defineTool({
 			}),
 			{ minItems: 1 },
 		),
+		dryRun: Type.Optional(Type.Boolean({ description: "Check the edits and report their effect without applying them" })),
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
 		const sessionManager = ctx.sessionManager;
@@ -122,12 +145,13 @@ const editContextTool = defineTool({
 		const edited = projectWithEdits(sessionManager, edits);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		pendingEditsBySession.set(sessionId, edits);
+		if (!parameters.dryRun) pendingEditsBySession.set(sessionId, edits);
 
 		const editedIds = new Set(edits.map(({ targetId }) => targetId));
 		const firstEditedIndex = current.entries.findIndex(({ sourceEntry }) => editedIds.has(sourceEntry.id));
 		const uncachedTokens = current.entries.slice(firstEditedIndex).reduce((total, { messages }) => total + messages.reduce((sum, message) => sum + estimateTokens(message), 0), 0);
-		const text = `Queued ${parameters.edits.length} edit(s). From your next request your context is ~${tokensOf(edited)} tokens (was ~${tokensOf(current)}). About ${uncachedTokens} tokens after the earliest edit will be reprocessed without the prompt cache once.`;
+		const verdict = parameters.dryRun ? `Dry run: the ${parameters.edits.length} edit(s) are valid and were not applied. If applied, from your next request` : `Queued ${parameters.edits.length} edit(s). From your next request`;
+		const text = `${verdict} your context is ~${tokensOf(edited)} tokens (was ~${tokensOf(current)}). About ${uncachedTokens} tokens after the earliest edit will be reprocessed without the prompt cache once.`;
 		return { content: [{ type: "text" as const, text }] };
 	},
 });
