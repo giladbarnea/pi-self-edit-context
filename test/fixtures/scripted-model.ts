@@ -32,7 +32,8 @@ function signedThinking(label: string) {
 	return { ...fauxThinking(label + "t".repeat(400 - label.length)), thinkingSignature: "s".repeat(3600) };
 }
 
-const outline = () => fauxAssistantMessage(fauxToolCall("context_outline", {}));
+const readNull = () => fauxToolCall("read", { path: "/dev/null" });
+const outline = () => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 0 }));
 const record: ScriptStep = (messages) => {
 	recordContext(messages);
 	return fauxAssistantMessage("done");
@@ -48,7 +49,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"outline-then-dry-run": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", { minTokens: 0 }), fauxToolCall("context_outline", { minTokens: 0 })]),
 		outline,
 		(messages) => {
 			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
@@ -70,7 +71,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"dry-run-breakdown": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", { minTokens: 0 })]),
 		outline,
 		(messages) => {
 			const [first] = assistantEntryIds(lastToolResultText(messages));
@@ -82,9 +83,9 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"drop-thinking": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
-		() => fauxAssistantMessage([signedThinking("THINK-B"), fauxToolCall("context_outline", {})]),
-		() => fauxAssistantMessage([signedThinking("THINK-C"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), readNull()]),
+		() => fauxAssistantMessage([signedThinking("THINK-B"), readNull()]),
+		() => fauxAssistantMessage([signedThinking("THINK-C"), fauxToolCall("context_outline", { minTokens: 0 })]),
 		(messages) => {
 			const [first, second, third] = assistantEntryIds(lastToolResultText(messages));
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ dropThinking: { before: third, except: [second] } }] }));
@@ -100,7 +101,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"replace-thinking-block": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", { minTokens: 0 })]),
 		(messages) => {
 			const [first] = assistantEntryIds(lastToolResultText(messages));
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id: `${first}.t0`, replacement: "SHORT-NOTE" }] }));
@@ -108,7 +109,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"stable-block-ids": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", { minTokens: 0 }), fauxToolCall("context_outline", { minTokens: 0 })]),
 		(messages) => {
 			const [first] = assistantEntryIds(lastToolResultText(messages));
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "FOLD-A" }] }));
@@ -123,7 +124,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"fold-then-restore": [
-		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", { minTokens: 0 })]),
 		(messages) => {
 			const [first] = assistantEntryIds(lastToolResultText(messages));
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "FOLD-A" }] }));
@@ -145,6 +146,51 @@ const scripts: Record<string, ScriptStep[]> = {
 			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ restore: id }] }));
 		},
+		record,
+	],
+	"auto-fold-outlines": [
+		outline,
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const ids = assistantEntryIds(lastToolResultText(messages));
+			// ids: [early outline, read, late outline]; fold the read, which sits between the two outlines.
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${ids[1]}.c0`, note: "READ-NOTE" }] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const note = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.text?.includes("result folded when edits applied"));
+			const restore = JSON.parse(note.text.match(/\{"restore": "\w+"\}/)[0]);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [restore] }));
+		},
+		record,
+	],
+	"fold-range": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const ids = assistantEntryIds(lastToolResultText(messages));
+			const secondReadResult = lastToolResultText(messages).split("\n").filter((line) => /^    - \S+ result/.test(line))[1].trim().split(" ")[1];
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ foldRange: { from: ids[0], to: secondReadResult, note: "RANGE-NOTE" } }] }));
+		},
+		record,
+	],
+	"fold-range-splits-exchange": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const ids = assistantEntryIds(lastToolResultText(messages));
+			// Ends at the second read's call, leaving its result outside the range.
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ foldRange: { from: ids[0], to: ids[1], note: "RANGE-NOTE" } }] }));
+		},
+		record,
+	],
+	"default-outline": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), readNull()]),
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		record,
 	],
 	"orphan-tool-results": [

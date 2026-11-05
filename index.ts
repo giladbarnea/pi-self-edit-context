@@ -18,17 +18,20 @@ type Operation =
 	| { id: string; replacement: string | null }
 	| { fold: string; note: string }
 	| { dropThinking: { before: string; except?: string[] } }
-	| { restore: string };
+	| { restore: string }
+	| { foldRange: { from: string; to: string; note: string } };
 
 const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", "compactionSummary"]);
 const PREVIEW_CHARACTERS = 200;
+const DEFAULT_MIN_TOKENS = 2000;
+const OUTLINE_TOOL = "context_outline";
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
 const EMPTIED_ASSISTANT_TEXT = "[thinking removed]";
 
 /** Edits queued this turn. Pi persists them at the turn boundary, before the next request. */
 const pendingEditsBySession = new Map<string, ContextEdit[]>();
 /** Dry-run plans the agent can apply by ID without resending them. They live in memory, so a reload clears them. */
-const plansById = new Map<string, { sessionId: string; edits: ContextEdit[]; breakdown: string }>();
+const plansById = new Map<string, { sessionId: string; edits: ContextEdit[]; breakdown: string; outlineNote: string }>();
 let planCount = 0;
 
 function isEditable(entry: SessionEntry): boolean {
@@ -177,34 +180,67 @@ function meterLine(usage: ContextUsage): string {
 
 const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use them to compare entries, not as real counts.";
 
-/** One bullet per entry; an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
-function outlineOf(projection: SessionProjection, usage: ContextUsage): string {
+type OutlineUnit = { entry: ProjectedEntry; lines: string[]; entries: number; tokens: number; thinkingTokens: number; anchor: boolean };
+
+/** One entry as bullets: an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
+function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>): OutlineUnit {
+	const message = entry.messages.at(-1)!;
+	if (message.role !== "assistant") {
+		const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
+		const line = `- ${labelled(entryHead(entry, label), textOf(message.content))}`;
+		return { entry, lines: [line], entries: 1, tokens: entryTokens(entry), thinkingTokens: 0, anchor: message.role === "user" };
+	}
+	const unit: OutlineUnit = { entry, lines: [`- ${entryHead(entry, "assistant")}`], entries: 1, tokens: entryTokens(entry), thinkingTokens: 0, anchor: false };
+	const ids = blockIdsOf(entry);
+	message.content.forEach((block: Block, index: number) => {
+		const kind = block.type === "toolCall" ? "call" : ids[index].includes(".n") ? "note" : block.type;
+		const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} est.`;
+		if (block.type === "thinking") {
+			unit.thinkingTokens += blockTokens(block);
+			unit.lines.push(`  - ${head}${block.thinkingSignature ? ", signed" : ""}`);
+		} else if (block.type === "toolCall") unit.lines.push(`  - ${labelled(head, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
+		else unit.lines.push(`  - ${labelled(head, block.text ?? "")}`);
+		const result = block.type === "toolCall" ? resultByCall.get(block) : undefined;
+		if (!result) return;
+		unit.lines.push(`    - ${labelled(entryHead(result, "result"), textOf(result.messages.at(-1)!.content))}`);
+		unit.entries += 1;
+		unit.tokens += entryTokens(result);
+	});
+	return unit;
+}
+
+/** @example collapsedLine([unit("a1", 2, 300, 0), unit("b2", 1, 200, 50)]) === "- … 3 entries a1 → b2, ~500 est., ~50 est. in thinking" */
+function collapsedLine(units: OutlineUnit[]): string {
+	const entries = units.reduce((total, unit) => total + unit.entries, 0);
+	const tokens = units.reduce((total, unit) => total + unit.tokens, 0);
+	const thinking = units.reduce((total, unit) => total + unit.thinkingTokens, 0);
+	const bounds = units.length === 1 ? units[0].entry.sourceEntry.id : `${units[0].entry.sourceEntry.id} → ${units.at(-1)!.entry.sourceEntry.id}`;
+	return `- … ${entries} entr${entries === 1 ? "y" : "ies"} ${bounds}, ~${formatTokens(tokens)} est.${thinking > 0 ? `, ~${formatTokens(thinking)} est. in thinking` : ""}`;
+}
+
+/** Entries of at least minTokens, and user messages, in full; each run of smaller entries as one line with its bounds and size. */
+function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
 	const removed = removedEntries(projection).length;
 	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
-	const lines = [`${visible.length} entries shown, ~${formatTokens(totalTokens(projection))} est.${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}`];
+	const collapseNote = minTokens > 0 ? ` Entries under ${formatTokens(minTokens)} est. are collapsed into runs with their bounds; {"minTokens": 0} shows every entry.` : "";
+	const lines = [`${visible.length} entries shown (~${formatTokens(totalTokens(projection))} est.)${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`];
+	let run: OutlineUnit[] = [];
+	const flush = (): void => {
+		if (run.length > 0) lines.push(collapsedLine(run));
+		run = [];
+	};
 	for (const entry of visible) {
 		if (nestedResults.has(entry)) continue;
-		const message = entry.messages.at(-1)!;
-		if (message.role !== "assistant") {
-			const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
-			lines.push(`- ${labelled(entryHead(entry, label), textOf(message.content))}`);
-			continue;
-		}
-		lines.push(`- ${entryHead(entry, "assistant")}`);
-		const ids = blockIdsOf(entry);
-		message.content.forEach((block: Block, index: number) => {
-			const kind = block.type === "toolCall" ? "call" : ids[index].includes(".n") ? "note" : block.type;
-			const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} est.`;
-			if (block.type === "thinking") lines.push(`  - ${head}${block.thinkingSignature ? ", signed" : ""}`);
-			else if (block.type === "toolCall") lines.push(`  - ${labelled(head, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
-			else lines.push(`  - ${labelled(head, block.text ?? "")}`);
-			const result = block.type === "toolCall" ? resultByCall.get(block) : undefined;
-			if (result) lines.push(`    - ${labelled(entryHead(result, "result"), textOf(result.messages.at(-1)!.content))}`);
-		});
+		const unit = outlineUnit(entry, resultByCall);
+		if (unit.anchor || unit.tokens >= minTokens) {
+			flush();
+			lines.push(...unit.lines);
+		} else run.push(unit);
 	}
+	flush();
 	return lines.join("\n");
 }
 
@@ -301,6 +337,22 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 				callIds.delete(source.message.toolCallId);
 				if (restorable(candidate)) restore(candidate);
 			}
+		} else if ("foldRange" in operation) {
+			const { from, to, note } = operation.foldRange;
+			const start = visible.findIndex((entry) => entry.sourceEntry.id === from);
+			const end = visible.findIndex((entry) => entry.sourceEntry.id === to);
+			if (start < 0 || end < 0) throw new Error(`foldRange bounds must be entry IDs in your current context; got ${from} → ${to}`);
+			if (end < start) throw new Error(`foldRange ${from} → ${to} ends before it starts`);
+			// Entries Pi cannot edit, such as tool-declaration system messages, stay where they are.
+			const range = visible.slice(start, end + 1).filter((entry) => isEditable(entry.sourceEntry));
+			const carrier = range.find((entry) => entry.messages.at(-1)!.role !== "toolResult");
+			if (!carrier) throw new Error(`foldRange ${from} → ${to} has no user or assistant message to hold the note`);
+			for (const entry of range) {
+				editableEntry(entry.sourceEntry.id);
+				replacements.set(entry.sourceEntry.id, null);
+			}
+			const role = carrier.messages.at(-1)!.role;
+			replacements.set(carrier.sourceEntry.id, { content: role === "assistant" ? [{ type: "text", text: note }] : note });
 		} else if ("dropThinking" in operation) {
 			const beforeIndex = visible.findIndex((entry) => entry.sourceEntry.id === operation.dropThinking.before);
 			if (beforeIndex < 0) throw new Error(`${operation.dropThinking.before} is not in your current context`);
@@ -334,11 +386,66 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 	return [...replacements].map(([targetId, replacement]) => ({ targetId, replacement }));
 }
 
+/** Position of the earliest entry the edits change, in the current context. */
+function earliestChange(base: SessionProjection, edits: ContextEdit[]): number {
+	const editedIds = new Set(edits.map(({ targetId }) => targetId));
+	return visibleEntries(base).findIndex((entry) => editedIds.has(entry.sourceEntry.id));
+}
+
+type OutlineCall = { entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number };
+
+/** Earlier context_outline calls with their results, excluding the agent's current message. */
+function outlineCalls(base: SessionProjection): OutlineCall[] {
+	const visible = visibleEntries(base);
+	const resultByCall = pairResults(visible);
+	const latestAssistant = visible.findLast((entry) => entry.messages.at(-1)!.role === "assistant");
+	return visible.flatMap((entry, position) => {
+		if (entry === latestAssistant || entry.messages.at(-1)!.role !== "assistant") return [];
+		const ids = blockIdsOf(entry);
+		return (entry.messages.at(-1)!.content as Block[]).flatMap((block, index) => {
+			const result = block.type === "toolCall" && block.name === OUTLINE_TOOL ? resultByCall.get(block) : undefined;
+			return result ? [{ entry, blockId: ids[index], result, position }] : [];
+		});
+	});
+}
+
+/** The note a folded outline leaves: what the batch removed, and how to get the outline back. */
+function foldedOutlineNote(base: SessionProjection, edits: ContextEdit[], outline: OutlineCall): string {
+	const visible = visibleEntries(base);
+	const removedIds = new Set(edits.filter(({ replacement }) => replacement === null).map(({ targetId }) => targetId));
+	const removed = visible.filter((entry) => removedIds.has(entry.sourceEntry.id));
+	const changed = edits.length - removed.length;
+	const removedPart = removed.length === 0
+		? "removed no entries"
+		: `removed ${removed.length} entr${removed.length === 1 ? "y" : "ies"} (${removed[0].sourceEntry.id} → ${removed.at(-1)!.sourceEntry.id}, ~${formatTokens(removed.reduce((total, entry) => total + entryTokens(entry), 0))} est.)`;
+	const time = new Date().toISOString().slice(11, 16);
+	return `[${OUTLINE_TOOL} result folded when edits applied at ${time}. Those edits ${removedPart} and changed ${changed}. {"restore": "${outline.entry.sourceEntry.id}"} brings this outline back; context_outline {"removed": true} lists removed entries.]`;
+}
+
+/**
+ * Fold the earlier outlines that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
+ * Outlines before the earliest change are left, since folding them would move the cache break earlier.
+ */
+function withOutlineFolds(base: SessionProjection, operations: Operation[], edits: ContextEdit[]): { edits: ContextEdit[]; note: string } {
+	if (edits.length === 0) return { edits, note: "" };
+	const earliest = earliestChange(base, edits);
+	const targeted = new Set(edits.map(({ targetId }) => targetId));
+	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id));
+	const folded = calls.filter((call) => call.position > earliest);
+	const left = calls.filter((call) => call.position <= earliest);
+	const leftNote = left.length === 0
+		? ""
+		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
+	if (folded.length === 0) return { edits, note: leftNote };
+	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, edits, call) }));
+	const foldedNote = ` Also folds ${folded.length} earlier outline${folded.length === 1 ? "" : "s"} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
+	return { edits: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
+}
+
 /** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
 function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): string {
 	const visible = visibleEntries(base);
-	const editedIds = new Set(edits.map(({ targetId }) => targetId));
-	const earliest = visible.findIndex((entry) => editedIds.has(entry.sourceEntry.id));
+	const earliest = earliestChange(base, edits);
 	const positionById = new Map(visible.map((entry, index) => [entry.sourceEntry.id, index]));
 	const reprocessed = visibleEntries(edited)
 		.filter((entry) => (positionById.get(entry.sourceEntry.id) ?? Infinity) >= earliest)
@@ -356,6 +463,7 @@ function effectReport(base: SessionProjection, edited: SessionProjection, edits:
 function operationLabel(operation: Operation): string {
 	if ("fold" in operation) return `fold ${operation.fold}`;
 	if ("restore" in operation) return `restore ${operation.restore}`;
+	if ("foldRange" in operation) return `foldRange ${operation.foldRange.from} → ${operation.foldRange.to}`;
 	if ("dropThinking" in operation) return `dropThinking before ${operation.dropThinking.before}`;
 	return `${operation.replacement === null ? "remove" : "replace"} ${operation.id}`;
 }
@@ -378,11 +486,15 @@ const contextOutlineTool = defineTool({
 		"Outline your current context window. The header gives the real context size from Pi's usage meter; each entry is a bullet with its ID, role, time, estimated size, and the first line of its text.",
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
+		`By default, user messages and entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are shown in full, and each run of smaller entries is one line with its bounds, size and thinking; set minTokens to change the threshold, 0 for every entry.`,
 	].join(" "),
-	parameters: Type.Object({ removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })) }),
+	parameters: Type.Object({
+		removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })),
+		minTokens: Type.Optional(Type.Number({ description: `Show entries of at least this many estimated tokens in full; default ${DEFAULT_MIN_TOKENS}, 0 for all` })),
+	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
 		const projection = ctx.sessionManager.buildSessionProjection();
-		const text = parameters.removed ? removedOutlineOf(projection) : outlineOf(projection, ctx.getContextUsage());
+		const text = parameters.removed ? removedOutlineOf(projection) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS);
 		return { content: [{ type: "text" as const, text }] };
 	},
 });
@@ -396,6 +508,8 @@ const editContextTool = defineTool({
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
 		"{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result.",
+		"{foldRange: {from: entryId, to: entryId, note}}: replace a contiguous stretch of entries with one note you write; its first user or assistant message holds the note and the rest are removed. A range that would split a call from its result is refused.",
+		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what was removed and how to restore it.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
 		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
@@ -407,6 +521,7 @@ const editContextTool = defineTool({
 					Type.Object({ fold: Type.String(), note: Type.String() }),
 					Type.Object({ dropThinking: Type.Object({ before: Type.String(), except: Type.Optional(Type.Array(Type.String())) }) }),
 					Type.Object({ restore: Type.String() }),
+					Type.Object({ foldRange: Type.Object({ from: Type.String(), to: Type.String(), note: Type.String() }) }),
 				]),
 				{ minItems: 1 },
 			),
@@ -422,25 +537,26 @@ const editContextTool = defineTool({
 
 		let edits: ContextEdit[];
 		let breakdown: string;
+		let outlineNote: string;
 		if (parameters.apply !== undefined) {
 			const plan = plansById.get(parameters.apply);
 			if (!plan || plan.sessionId !== sessionId) throw new Error(`No dry-run plan ${parameters.apply} in this session; plans are lost on reload, so run the dry run again`);
-			({ edits, breakdown } = plan);
+			({ edits, breakdown, outlineNote } = plan);
 		} else {
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
 			const operations = parameters.operations as Operation[];
-			edits = compileOperations(base, operations);
+			({ edits, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations)));
 			breakdown = operationBreakdown(sessionManager, queued, base, operations);
 		}
 
 		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const report = effectReport(base, edited, edits) + breakdown;
+		const report = effectReport(base, edited, edits) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;
-			plansById.set(planId, { sessionId, edits, breakdown });
+			plansById.set(planId, { sessionId, edits, breakdown, outlineNote });
 			return { content: [{ type: "text" as const, text: `Dry run, nothing applied. ${report} To apply exactly this, call edit_context with {"apply": "${planId}"}.` }] };
 		}
 		pendingEditsBySession.set(sessionId, [...queued, ...edits]);

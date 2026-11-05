@@ -4,7 +4,7 @@ Lets a Pi agent edit its own context window mid-run.
 
 ## `context_outline`
 
-Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. An entry's size is the sum of its blocks, signatures included, so the header total equals the sum of the lines.
+Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. By default, user messages and entries of 2k+ est. tokens are shown in full; each run of smaller entries is one line with its bounds, size and thinking, so the small tail stays visible as a cost. `{minTokens: 0}` shows every entry. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. An entry's size is the sum of its blocks, signatures included, so the header total equals the sum of the lines.
 
 ## `edit_context`
 
@@ -13,11 +13,16 @@ Operations, by ID from the outline:
 - `{id, replacement}`: with an entry ID, replace the whole message with text, or remove it with `null`. With a thinking or text block ID, replace just that block with a short text note, or drop it with `null`.
 - `{fold: callBlockId, note}`: replace a tool call with a note and remove its result, in one step.
 - `{dropThinking: {before: entryId, except?: [entry or block IDs]}}`: drop every thinking block in the entries before that entry, except the ones named.
+- `{foldRange: {from, to, note}}`: replace a contiguous stretch of entries with one note the agent writes. Its first user or assistant message holds the note; the rest are removed. A range that would split a call from its result is refused.
 - `{restore: entryId}`: bring an edited or removed entry back to its stored original. Restoring a call also restores its removed result. Restoring an unedited entry is refused, since it would only break the cache.
 
 `dryRun: true` reports the tokens freed, the earliest change and how many tokens after it lose the prompt cache once, and confirms every call still has its result. It returns a plan ID, and `{apply: planId}` commits that exact plan without resending it.
 
 Edits are refused, and change nothing, if they would leave a call without its result or the reverse, make the context start with a non-user message, or touch the agent's current message.
+
+## Outlines fold themselves
+
+When edits apply, earlier `context_outline` results after the batch's earliest change are folded in the same batch. They lose the prompt cache anyway, so this costs nothing. Outlines before the earliest change are left, and the report names them, since folding one would move the cache break earlier. Each folded outline leaves a note: how many entries the batch removed, their bounds and size, and `{"restore": entryId}` to bring the outline back. Restoring it shows what the agent saw and the IDs it needs to restore the removed entries themselves.
 
 ## How it works
 

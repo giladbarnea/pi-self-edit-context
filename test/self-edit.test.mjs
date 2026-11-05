@@ -44,7 +44,7 @@ test("the outline gives blocks their own IDs and sizes, and nests each tool resu
 	// The second outline call sees the first, two-call assistant entry and both of its results.
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries/.test(text)).at(-1);
 	assert.ok(outline, "no outline result reached the model");
-	assert.match(outline, /^\d+ entries shown, ~[\d.]+k? est\./, `outline header: ${outline.split("\n")[0]}`);
+	assert.match(outline, /^\d+ entries shown \(~[\d.]+k? est\.\)\. Context/, `outline header: ${outline.split("\n")[0]}`);
 	const callEntry = messageEntries(entries, "assistant")[0];
 	const resultIds = messageEntries(entries, "toolResult").map((entry) => entry.id);
 	const lines = outline.split("\n");
@@ -53,9 +53,9 @@ test("the outline gives blocks their own IDs and sizes, and nests each tool resu
 	const expected = [
 		new RegExp(`^- ${callEntry.id} assistant, .*, ~1\\.0k est\\.$`),
 		new RegExp(`^  - ${callEntry.id}\\.t0 thinking, ~1\\.0k est\\., signed$`),
-		new RegExp(`^  - ${callEntry.id}\\.c0 call, ~\\d+ est\\.: context_outline\\(\\{\\}\\)$`),
+		new RegExp(`^  - ${callEntry.id}\\.c0 call, ~\\d+ est\\.: context_outline\\(\\{"minTokens":0\\}\\)$`),
 		new RegExp(`^    - ${resultIds[0]} result, `),
-		new RegExp(`^  - ${callEntry.id}\\.c1 call, ~\\d+ est\\.: context_outline\\(\\{\\}\\)$`),
+		new RegExp(`^  - ${callEntry.id}\\.c1 call, ~\\d+ est\\.: context_outline\\(\\{"minTokens":0\\}\\)$`),
 		new RegExp(`^    - ${resultIds[1]} result, `),
 	];
 	const block = lines.slice(start, start + expected.length);
@@ -97,17 +97,19 @@ test("applying a dry-run plan by its ID commits exactly that plan", () => {
 	const { contexts, contextAfterEdit, entries } = runAgent("dry-run-then-apply", "ORIGINAL-REQUEST: anything");
 	assert.match(textOf(contexts[0].find((message) => message.role === "user")), /ORIGINAL-REQUEST/, "the dry run changed the context");
 	assert.equal(textOf(contextAfterEdit.find((message) => message.role === "user")), "APPLIED-LATER");
-	assert.equal(entries.filter((entry) => entry.type === "context_edit").length, 1, "the plan should be persisted exactly once");
+	const userEntry = messageEntries(entries, "user")[0];
+	assert.equal(entries.filter((entry) => entry.type === "context_edit" && entry.targetId === userEntry.id).length, 1, "the plan's edit should be persisted exactly once");
+	const planned = Number(textOf(contexts[0].findLast((message) => message.role === "toolResult")).match(/(\d+) entr(?:y|ies) changed/)[1]);
+	assert.equal(entries.filter((entry) => entry.type === "context_edit").length, planned, "apply should persist exactly what the dry run planned");
 });
 
 test("dropThinking removes old thinking except what the agent names, and keeps every call", () => {
 	const { contextAfterEdit } = runAgent("drop-thinking", "ORIGINAL-REQUEST: anything");
 	const thinking = contextAfterEdit.flatMap((message) => (message.role === "assistant" ? message.content.filter((block) => block.type === "thinking") : [])).map((block) => block.thinking.slice(0, 7));
 	assert.deepEqual(thinking, ["THINK-B", "THINK-C"], `thinking the model still saw: ${thinking}`);
-	const calls = contextAfterEdit.flatMap((message) => (message.role === "assistant" ? message.content.filter((block) => block.type === "toolCall") : []));
-	const results = contextAfterEdit.filter((message) => message.role === "toolResult");
-	assert.equal(calls.length, 4, "every call should survive");
-	assert.deepEqual(results.map((result) => result.toolCallId), calls.map((call) => call.id), "every call should keep its result");
+	const reads = contextAfterEdit.flatMap((message) => (message.role === "assistant" ? message.content.filter((block) => block.type === "toolCall" && block.name === "read") : []));
+	assert.equal(reads.length, 2, "dropping thinking must keep the calls in those entries");
+	for (const read of reads) assert.ok(contextAfterEdit.some((message) => message.role === "toolResult" && message.toolCallId === read.id), `read ${read.id} lost its result`);
 });
 
 test("fold replaces a call with a note and removes its result in one step", () => {
@@ -157,7 +159,11 @@ test("restore brings a folded call back with its result, exactly as stored, and 
 	assert.deepEqual(seenResult?.content, result.message.content, "the folded result did not come back as stored");
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries shown/.test(text)).at(-1);
 	const lines = outline.split("\n");
-	assert.ok(!lines[0].includes("removed by edits") && !lines.some((line) => line.endsWith(", edited")), `after restore nothing should be marked edited or removed:\n${outline}`);
+	// The removed-entries listing is itself an outline, so the restore batch folds it; the restored pair must read as unedited.
+	for (const id of [entry.id, result.id]) {
+		const line = lines.find((candidate) => candidate.trim().startsWith(`- ${id} `));
+		assert.ok(line && !line.includes(", edited"), `${id} should be back and unedited after restore:\n${outline}`);
+	}
 	const restoreReport = textOf(contexts.at(-1).findLast((message) => message.role === "toolResult" && textOf(message).startsWith("Applied")));
 	assert.match(restoreReport, /Adds ~\d+ est\. tokens/, `a restore grows the context and should say so: ${restoreReport}`);
 });
@@ -168,6 +174,55 @@ test("restoring an entry that was never edited is refused instead of breaking th
 	assert.equal(refusal.isError, true, `restore should refuse, got: ${textOf(refusal)}`);
 	assert.match(textOf(refusal), /not edited/);
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a no-op restore was persisted");
+});
+
+test("applying edits folds earlier outlines after the earliest change, leaves earlier ones, and the note leads back", () => {
+	const { contexts, contextAfterEdit, entries } = runAgent("auto-fold-outlines", "ORIGINAL-REQUEST: anything");
+	const [earlyOutline, read, lateOutline] = messageEntries(entries, "assistant");
+	const results = messageEntries(entries, "toolResult");
+	const resultOf = (call) => results.find((candidate) => candidate.message.toolCallId === call.message.content[0].id);
+	const afterEdit = contexts[0];
+	const report = textOf(afterEdit.findLast((message) => message.role === "toolResult"));
+	assert.match(report, new RegExp(`Also folds 1 earlier outline after the earliest change \\(${lateOutline.id}\\.c0\\)`), `report: ${report}`);
+	assert.match(report, new RegExp(`Left in place, before the earliest change: outline ${earlyOutline.id}\\.c0`), `report: ${report}`);
+	assert.ok(afterEdit.some((message) => message.role === "toolResult" && message.toolCallId === earlyOutline.message.content[0].id), "the outline before the earliest change must stay, or the cache break moves earlier");
+	assert.ok(!afterEdit.some((message) => message.role === "toolResult" && message.toolCallId === lateOutline.message.content[0].id), "the outline after the earliest change should be folded");
+	const note = textOf(afterEdit.find((message) => message.role === "assistant" && textOf(message).includes("result folded when edits applied")));
+	const readResult = resultOf(read);
+	assert.match(note, new RegExp(`removed 1 entry \\(${readResult.id} → ${readResult.id}, ~\\d+ est\\.\\)`), `note should name what the batch removed: ${note}`);
+	assert.match(note, new RegExp(`\\{"restore": "${lateOutline.id}"\\}`), `note should say how to restore the outline: ${note}`);
+	const restored = contextAfterEdit.find((message) => message.role === "toolResult" && message.toolCallId === lateOutline.message.content[0].id);
+	assert.deepEqual(restored?.content, resultOf(lateOutline).message.content, "restoring the note's entry should bring the outline back as stored");
+});
+
+test("foldRange replaces a stretch with one note and removes the rest, calls and results together", () => {
+	const { contextAfterEdit, entries } = runAgent("fold-range", "ORIGINAL-REQUEST: anything");
+	const [firstRead, secondRead] = messageEntries(entries, "assistant");
+	const seenAssistants = contextAfterEdit.filter((message) => message.role === "assistant");
+	assert.equal(textOf(seenAssistants[0]), "RANGE-NOTE", `the range's first assistant should hold the note: ${JSON.stringify(seenAssistants[0].content)}`);
+	const readCallIds = [firstRead, secondRead].map((entry) => entry.message.content[0].id);
+	const leftovers = contextAfterEdit.filter((message) => (message.role === "toolResult" && readCallIds.includes(message.toolCallId)) || (message.role === "assistant" && message.content.some((block) => readCallIds.includes(block.id))));
+	assert.deepEqual(leftovers, [], "nothing from inside the range should remain");
+	assert.ok(textOf(contextAfterEdit.find((message) => message.role === "user")).includes("ORIGINAL-REQUEST"), "the user message before the range must stay");
+});
+
+test("a foldRange that would split a call from its result is refused and changes nothing", () => {
+	const { contextAfterEdit, entries } = runAgent("fold-range-splits-exchange", "ORIGINAL-REQUEST: anything");
+	const refusal = contextAfterEdit.findLast((message) => message.role === "toolResult");
+	assert.equal(refusal.isError, true, `foldRange should refuse, got: ${textOf(refusal)}`);
+	assert.match(textOf(refusal), /would lose its tool call/);
+	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a refused foldRange was persisted");
+});
+
+test("the default outline collapses small entries into runs that keep their bounds, size and thinking", () => {
+	const { contextAfterEdit, entries } = runAgent("default-outline", "ORIGINAL-REQUEST: anything");
+	const outline = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));
+	const [firstRead, , outlineCall] = messageEntries(entries, "assistant");
+	const lines = outline.split("\n");
+	assert.ok(lines.some((line) => line.startsWith("- ") && line.includes(" user, ")), `user messages should always be shown:\n${outline}`);
+	assert.ok(!lines.some((line) => line.startsWith(`- ${firstRead.id} assistant`)), `small entries should not get their own lines:\n${outline}`);
+	// Two reads, their two results, and the entry making this outline call form one run of 5 entries.
+	assert.ok(lines.includes(`- … 5 entries ${firstRead.id} → ${outlineCall.id}, ~1.0k est., ~1.0k est. in thinking`), `run line missing or wrong:\n${outline}`);
 });
 
 test("an edit that would separate tool calls from their results is refused and changes nothing", () => {
