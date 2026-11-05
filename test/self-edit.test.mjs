@@ -38,18 +38,26 @@ test("an edit the agent makes applies to its very next request in the same run",
 	assert.ok(entries.some((entry) => entry.type === "context_edit" && entry.targetId === storedUser.id), "no context_edit entry was persisted");
 });
 
-test("the outline gives a total and pairs each tool result with the entry holding its call", () => {
+test("the outline nests an assistant's blocks under it and each tool result under its call", () => {
 	const { contextAfterEdit, entries } = runAgent("outline-then-dry-run", "ORIGINAL-REQUEST: anything");
-	// The second outline call sees the first call and its result.
+	// The second outline call sees the first, two-call assistant entry and both of its results.
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries/.test(text)).at(-1);
-	assert.match(outline, /^\d+ entries, ~\d+ tokens total/, `outline header: ${outline.split("\n")[0]}`);
-	const callEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant");
 	assert.ok(outline, "no outline result reached the model");
-	const resultLines = outline.split("\n").filter((line) => line.includes(" toolResult "));
-	assert.ok(resultLines[0]?.includes(`answers ${callEntry.id}#1`), `first result should answer call 1 of ${callEntry.id}: ${resultLines[0]}`);
-	assert.ok(resultLines[1]?.includes(`answers ${callEntry.id}#2`), `second result should answer call 2 of ${callEntry.id}: ${resultLines[1]}`);
-	const callLine = outline.split("\n").find((line) => line.startsWith(callEntry.id));
-	assert.match(callLine, /thinking ~1\.0k/, `4,000 characters of thinking should show as ~1.0k tokens: ${callLine}`);
+	assert.match(outline, /^\d+ entries, ~[\d.]+k? tokens total/, `outline header: ${outline.split("\n")[0]}`);
+	const callEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+	const resultIds = entries.filter((entry) => entry.type === "message" && entry.message.role === "toolResult").map((entry) => entry.id);
+	const lines = outline.split("\n");
+	const start = lines.findIndex((line) => line.startsWith(`- ${callEntry.id} assistant`));
+	const expected = [
+		/^  - thinking, ~1\.0k tokens$/,
+		/^  - call, ~\d+ tokens: context_outline\(\{\}\)$/,
+		new RegExp(`^    - ${resultIds[0]} result, `),
+		/^  - call, ~\d+ tokens: context_outline\(\{\}\)$/,
+		new RegExp(`^    - ${resultIds[1]} result, `),
+	];
+	const block = lines.slice(start + 1, start + 1 + expected.length);
+	expected.forEach((pattern, index) => assert.match(block[index] ?? "", pattern, `line ${index + 1} under the assistant:\n${block.join("\n")}`));
+	assert.equal(lines.filter((line) => line.includes(" result")).length, 2, "each result should appear once, nested under its call");
 });
 
 test("a dry run reports the outcome without changing the context", () => {

@@ -2,7 +2,7 @@
 
 Lets a Pi agent edit its own context window with two tools:
 
-- `context_outline` lists the messages in context: entry ID, role, estimated tokens, first line.
+- `context_outline` outlines the context as nested bullets: each entry with its ID, role, time, tokens and first line; an assistant entry's thinking, text and calls under it; each tool result under its call.
 - `edit_context` replaces a message's content with new text, or removes it from context (`replacement: null`).
 
 Edits apply from the agent's next request in the same run. The extension queues them and returns them from Pi's `turn_end` boundary as native `context_edit` entries; Pi validates and appends them, then rebuilds the running agent's context. The session file keeps every original message, so the edits survive resume and the originals stay inspectable.

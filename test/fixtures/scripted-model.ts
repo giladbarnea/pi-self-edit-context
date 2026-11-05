@@ -15,9 +15,9 @@ function lastToolResultText(messages: any[]): string {
 }
 
 function outlineId(outline: string, role: string, textFragment: string): string {
-	const line = outline.split("\n").find((candidate) => candidate.includes(` ${role} `) && candidate.includes(textFragment));
+	const line = outline.split("\n").find((candidate) => new RegExp(`^\\s*- \\S+ ${role}\\b`).test(candidate) && candidate.includes(textFragment));
 	if (!line) throw new Error(`No ${role} line containing "${textFragment}" in outline:\n${outline}`);
-	return line.split(" ")[0];
+	return line.trim().split(" ")[1];
 }
 
 function recordContext(messages: any[]): void {
@@ -51,7 +51,7 @@ const scripts: Record<string, ScriptStep[]> = {
 	"orphan-tool-results": [
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		(messages) => {
-			const id = outlineId(lastToolResultText(messages), "assistant", "context_outline");
+			const id = outlineId(lastToolResultText(messages), "assistant", "");
 			return fauxAssistantMessage(fauxToolCall("edit_context", { edits: [{ id, replacement: null }] }));
 		},
 		(messages) => {

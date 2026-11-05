@@ -25,7 +25,7 @@ function isEditable(entry: SessionEntry): boolean {
 function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
-	return content.map((block) => (block.type === "text" ? block.text : block.type === "toolCall" ? `→ ${block.name}(${JSON.stringify(block.arguments)})` : "")).join(" ");
+	return content.map((block) => (block.type === "text" ? block.text : "")).join(" ");
 }
 
 /** @example formatTokens(950) === "950"; formatTokens(4123) === "4.1k" */
@@ -33,25 +33,11 @@ function formatTokens(tokens: number): string {
 	return tokens < 1000 ? String(tokens) : `${(tokens / 1000).toFixed(1)}k`;
 }
 
-/** Characters a block sends, signatures included; Pi's estimate is about four characters per token. */
-function blockCharacters(block: any): number {
-	if (block.type === "thinking") return (block.thinking?.length ?? 0) + (block.thinkingSignature?.length ?? 0);
-	if (block.type === "toolCall") return block.name.length + JSON.stringify(block.arguments).length;
-	return block.text?.length ?? 0;
-}
-
-/** @example blockSummary([{ type: "thinking", thinking: "x".repeat(4000) }, { type: "toolCall", name: "a", arguments: {} }]) === "[thinking ~1.0k+1 call ~1]" */
-function blockSummary(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	const characters = new Map<string, number>();
-	const calls = content.filter((block) => block.type === "toolCall").length;
-	for (const block of content) characters.set(block.type, (characters.get(block.type) ?? 0) + blockCharacters(block));
-	if (characters.size < 2 && calls < 2) return "";
-	const parts = [...characters].map(([type, count]) => {
-		const label = type === "toolCall" ? (calls === 1 ? "1 call" : `${calls} calls`) : type;
-		return `${label} ~${formatTokens(Math.ceil(count / 4))}`;
-	});
-	return `[${parts.join("+")}]`;
+/** Estimated tokens of one content block, signatures included, at Pi's four characters per token. */
+function blockTokens(block: any): number {
+	if (block.type === "thinking") return Math.ceil(((block.thinking?.length ?? 0) + (block.thinkingSignature?.length ?? 0)) / 4);
+	if (block.type === "toolCall") return Math.ceil((block.name.length + JSON.stringify(block.arguments).length) / 4);
+	return Math.ceil((block.text?.length ?? 0) / 4);
 }
 
 /** @example previewOf("first line\nsecond") === "first line"; previewOf("a".repeat(150) + "b".repeat(150)) === "a".repeat(98) + "[…]" + "b".repeat(99) */
@@ -97,37 +83,78 @@ function tokensOf(projection: SessionProjection): number {
 	return projection.messages.reduce((total, message) => total + estimateTokens(message), 0);
 }
 
+type ProjectedEntry = SessionProjection["entries"][number];
+
+/** @example labelled("a1b2c3d4 user, 11-05 22:00, ~5 tokens", "hi\nthere") === "a1b2c3d4 user, 11-05 22:00, ~5 tokens: hi" */
+function labelled(head: string, text: string): string {
+	const preview = previewOf(text);
+	return preview ? `${head}: ${preview}` : head;
+}
+
+function entryHead({ sourceEntry, messages }: ProjectedEntry, label: string): string {
+	const tokens = messages.reduce((total, message) => total + estimateTokens(message), 0);
+	const parts = [`${sourceEntry.id} ${label}`, sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(tokens)} tokens`];
+	if (!isEditable(sourceEntry)) parts.push("not editable");
+	return parts.join(", ");
+}
+
+/** Pair each tool result with its call the way Pi replays them: the earliest unanswered call with that ID. */
+function pairResults(entries: ProjectedEntry[]): Map<object, ProjectedEntry> {
+	const resultByCall = new Map<object, ProjectedEntry>();
+	const openCalls = new Map<string, object[]>();
+	for (const entry of entries) {
+		const message = entry.messages.at(-1)!;
+		if (message.role === "assistant") {
+			for (const block of message.content) if (block.type === "toolCall") openCalls.set(block.id, [...(openCalls.get(block.id) ?? []), block]);
+		}
+		if (message.role === "toolResult") {
+			const call = openCalls.get(message.toolCallId)?.shift();
+			if (call) resultByCall.set(call, entry);
+		}
+	}
+	return resultByCall;
+}
+
+/** One bullet per entry; an assistant entry's blocks nest under it, and each tool result nests under its call. */
+function outlineOf(projection: SessionProjection): string {
+	const visible = projection.entries.filter(({ messages }) => messages.length > 0);
+	const resultByCall = pairResults(visible);
+	const nestedResults = new Set(resultByCall.values());
+	const lines = [`${visible.length} entries, ~${formatTokens(tokensOf(projection))} tokens total`];
+	for (const entry of visible) {
+		if (nestedResults.has(entry)) continue;
+		const message = entry.messages.at(-1)!;
+		if (message.role !== "assistant") {
+			const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
+			lines.push(`- ${labelled(entryHead(entry, label), textOf(message.content))}`);
+			continue;
+		}
+		lines.push(`- ${entryHead(entry, "assistant")}`);
+		for (const block of message.content) {
+			const size = `~${formatTokens(blockTokens(block))} tokens`;
+			if (block.type !== "toolCall") {
+				lines.push(`  - ${labelled(`${block.type}, ${size}`, block.type === "text" ? block.text : "")}`);
+				continue;
+			}
+			lines.push(`  - ${labelled(`call, ${size}`, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
+			const result = resultByCall.get(block);
+			if (result) lines.push(`    - ${labelled(entryHead(result, "result"), textOf(result.messages.at(-1)!.content))}`);
+		}
+	}
+	return lines.join("\n");
+}
+
 const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
-	description:
-		"List the messages in your current context window, one line each: entry ID, role, time, estimated tokens, block kinds, for a tool result the call it answers (entry ID, plus #n when the entry made several calls), and the first line of text. Use the IDs with edit_context.",
+	description: [
+		"Outline your current context window. Each entry is a bullet: entry ID, role, time, estimated tokens, and the first line of its text.",
+		"An assistant entry's thinking, text and tool calls are nested under it, and each tool result is nested under the call that produced it.",
+		"Edit whole entries by ID with edit_context; nested blocks have no ID of their own.",
+	].join(" "),
 	parameters: Type.Object({}),
 	async execute(_toolCallId, _parameters, _signal, _onUpdate, ctx) {
-		const projection = ctx.sessionManager.buildSessionProjection();
-		const visible = projection.entries.filter(({ messages }) => messages.length > 0);
-		const callByCallId = new Map<string, string>();
-		const lines = visible.map(({ sourceEntry, messages }) => {
-			const message = messages.at(-1)!;
-			if (message.role === "assistant") {
-				const calls = message.content.filter((block) => block.type === "toolCall");
-				calls.forEach((call, index) => callByCallId.set(call.id, calls.length > 1 ? `${sourceEntry.id}#${index + 1}` : sourceEntry.id));
-			}
-			const tokens = messages.reduce((total, part) => total + estimateTokens(part), 0);
-			const fields = [
-				sourceEntry.id,
-				message.role,
-				sourceEntry.timestamp.slice(5, 16).replace("T", " "),
-				`~${tokens}tok`,
-				isEditable(sourceEntry) ? "" : "[not editable]",
-				blockSummary(message.content),
-				message.role === "toolResult" ? `answers ${callByCallId.get(message.toolCallId) ?? "?"}` : "",
-				previewOf(textOf(message.content)),
-			];
-			return fields.filter(Boolean).join(" ");
-		});
-		const header = `${visible.length} entries, ~${tokensOf(projection)} tokens total`;
-		return { content: [{ type: "text" as const, text: [header, ...lines].join("\n") }] };
+		return { content: [{ type: "text" as const, text: outlineOf(ctx.sessionManager.buildSessionProjection()) }] };
 	},
 });
 
