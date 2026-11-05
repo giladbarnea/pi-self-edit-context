@@ -44,7 +44,7 @@ test("the outline gives blocks their own IDs and sizes, and nests each tool resu
 	// The second outline call sees the first, two-call assistant entry and both of its results.
 	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries/.test(text)).at(-1);
 	assert.ok(outline, "no outline result reached the model");
-	assert.match(outline, /^\d+ entries, ~[\d.]+k? tokens total/, `outline header: ${outline.split("\n")[0]}`);
+	assert.match(outline, /^\d+ entries shown, ~[\d.]+k? tokens total/, `outline header: ${outline.split("\n")[0]}`);
 	const callEntry = messageEntries(entries, "assistant")[0];
 	const resultIds = messageEntries(entries, "toolResult").map((entry) => entry.id);
 	const lines = outline.split("\n");
@@ -114,6 +114,49 @@ test("a block ID edits just that block and leaves the entry's call and result", 
 	assert.deepEqual(firstAssistant.content.map((block) => block.type), ["text", "toolCall"], `blocks: ${JSON.stringify(firstAssistant.content)}`);
 	assert.equal(firstAssistant.content[0].text, "SHORT-NOTE");
 	assert.ok(contextAfterEdit.some((message) => message.role === "toolResult" && message.toolCallId === firstAssistant.content[1].id), "the call lost its result");
+});
+
+test("block IDs from an old outline still name the same blocks after an earlier edit in the entry", () => {
+	// Folding .c0 turns that call into a note. If IDs were renumbered by position, the second call would become .c0
+	// and the agent's .c1 from its old outline would miss or hit the wrong block.
+	const { contextAfterEdit, entries } = runAgent("stable-block-ids", "ORIGINAL-REQUEST: anything");
+	const entry = messageEntries(entries, "assistant")[0];
+	const [callA, callB] = entry.message.content.filter((block) => block.type === "toolCall");
+	const seen = contextAfterEdit.find((message) => message.role === "assistant");
+	assert.deepEqual(seen.content.map((block) => block.type === "text" ? block.text : block.type), ["thinking", "FOLD-A", "FOLD-B"], `blocks: ${JSON.stringify(seen.content)}`);
+	const resultIds = contextAfterEdit.filter((message) => message.role === "toolResult").map((message) => message.toolCallId);
+	assert.ok(!resultIds.includes(callA.id) && !resultIds.includes(callB.id), "a folded call's result is still in context");
+	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries shown/.test(text)).at(-1);
+	const lines = outline.split("\n");
+	assert.match(outline, /, 2 removed by edits/, `header: ${lines[0]}`);
+	assert.ok(lines.includes(`  - ${entry.id}.t0 thinking, ~1.0k tokens, signed`), `thinking should keep .t0:\n${outline}`);
+	assert.ok(lines.some((line) => line.startsWith(`  - ${entry.id}.n0 note, `) && line.endsWith(": FOLD-A")), `first note should be .n0:\n${outline}`);
+	assert.ok(lines.some((line) => line.startsWith(`- ${entry.id} assistant, `) && line.endsWith(", edited")), `the entry should be marked edited:\n${outline}`);
+});
+
+test("restore brings a folded call back with its result, exactly as stored, and clears the edited marks", () => {
+	const { contexts, contextAfterEdit, entries } = runAgent("fold-then-restore", "ORIGINAL-REQUEST: anything");
+	const entry = messageEntries(entries, "assistant")[0];
+	const result = messageEntries(entries, "toolResult")[0];
+	const removedList = textOf(contexts[0].findLast((message) => message.role === "toolResult"));
+	assert.match(removedList, new RegExp(`^- ${result.id} toolResult, `, "m"), `the removed list should name the folded result:\n${removedList}`);
+	const seen = contextAfterEdit.find((message) => message.role === "assistant");
+	assert.deepEqual(seen.content, entry.message.content, "the restored call is not byte-identical to the stored original");
+	const seenResult = contextAfterEdit.find((message) => message.role === "toolResult" && message.toolCallId === result.message.toolCallId);
+	assert.deepEqual(seenResult?.content, result.message.content, "the folded result did not come back as stored");
+	const outline = contextAfterEdit.filter((message) => message.role === "toolResult").map(textOf).filter((text) => /^\d+ entries shown/.test(text)).at(-1);
+	const lines = outline.split("\n");
+	assert.ok(!lines[0].includes("removed by edits") && !lines.some((line) => line.endsWith(", edited")), `after restore nothing should be marked edited or removed:\n${outline}`);
+	const restoreReport = textOf(contexts.at(-1).findLast((message) => message.role === "toolResult" && textOf(message).startsWith("Applied")));
+	assert.match(restoreReport, /Adds ~\d+ tokens/, `a restore grows the context and should say so: ${restoreReport}`);
+});
+
+test("restoring an entry that was never edited is refused instead of breaking the cache for nothing", () => {
+	const { contextAfterEdit, entries } = runAgent("restore-unedited", "ORIGINAL-REQUEST: anything");
+	const refusal = contextAfterEdit.findLast((message) => message.role === "toolResult");
+	assert.equal(refusal.isError, true, `restore should refuse, got: ${textOf(refusal)}`);
+	assert.match(textOf(refusal), /not edited/);
+	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a no-op restore was persisted");
 });
 
 test("an edit that would separate tool calls from their results is refused and changes nothing", () => {

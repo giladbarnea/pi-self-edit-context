@@ -107,6 +107,46 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	"stable-block-ids": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
+		(messages) => {
+			const [first] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "FOLD-A" }] }));
+		},
+		(messages) => {
+			// Reuse the ID from the old outline instead of reading a new one.
+			const oldOutline = messages.find((message) => message.role === "toolResult").content[0].text;
+			const [first] = assistantEntryIds(oldOutline);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c1`, note: "FOLD-B" }] }));
+		},
+		outline,
+		record,
+	],
+	"fold-then-restore": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		(messages) => {
+			const [first] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "FOLD-A" }] }));
+		},
+		() => fauxAssistantMessage(fauxToolCall("context_outline", { removed: true })),
+		(messages) => {
+			recordContext(messages);
+			// The fold removed the outline it read, so take the entry ID from its own earlier fold call.
+			const foldCall = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.arguments?.operations?.[0]?.fold);
+			const first = foldCall.arguments.operations[0].fold.split(".")[0];
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ restore: first }] }));
+		},
+		outline,
+		record,
+	],
+	"restore-unedited": [
+		outline,
+		(messages) => {
+			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ restore: id }] }));
+		},
+		record,
+	],
 	"orphan-tool-results": [
 		outline,
 		(messages) => {

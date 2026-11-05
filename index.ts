@@ -2,6 +2,7 @@ import { Type } from "@earendil-works/pi-ai";
 import {
 	defineTool,
 	estimateTokens,
+	type ContextEditableContent,
 	type ContextEditEntry,
 	type ExtensionAPI,
 	type ReadonlySessionManager,
@@ -16,7 +17,8 @@ type Block = any;
 type Operation =
 	| { id: string; replacement: string | null }
 	| { fold: string; note: string }
-	| { dropThinking: { before: string; except?: string[] } };
+	| { dropThinking: { before: string; except?: string[] } }
+	| { restore: string };
 
 const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", "compactionSummary"]);
 const PREVIEW_CHARACTERS = 200;
@@ -75,8 +77,8 @@ function totalTokens(projection: SessionProjection): number {
 	return visibleEntries(projection).reduce((total, entry) => total + entryTokens(entry), 0);
 }
 
-/** Block IDs number each kind within its entry: t for thinking, x for text, c for calls. @example blockIds("e1", [{ type: "thinking" }, { type: "toolCall" }, { type: "toolCall" }]) === ["e1.t0", "e1.c0", "e1.c1"] */
-function blockIds(entryId: string, content: Block[]): string[] {
+/** Number each kind within an entry: t for thinking, x for text, c for calls. @example positionalBlockIds("e1", [{ type: "thinking" }, { type: "toolCall" }, { type: "toolCall" }]) === ["e1.t0", "e1.c0", "e1.c1"] */
+function positionalBlockIds(entryId: string, content: Block[]): string[] {
 	const counts = new Map<string, number>();
 	return content.map((block) => {
 		const letter = BLOCK_KIND_LETTERS[block.type] ?? "b";
@@ -84,6 +86,55 @@ function blockIds(entryId: string, content: Block[]): string[] {
 		counts.set(letter, index + 1);
 		return `${entryId}.${letter}${index}`;
 	});
+}
+
+/** The entry's content as stored in the session file, before any edit. */
+function originalContent(entry: SessionEntry): unknown {
+	return entry.type === "message" ? entry.message.content : (entry as { content: unknown }).content;
+}
+
+/** @example asBlocks("hi") === [{ type: "text", text: "hi" }] */
+function asBlocks(content: unknown): Block[] {
+	return typeof content === "string" ? [{ type: "text", text: content }] : (content as Block[]);
+}
+
+/**
+ * Block IDs that survive edits: each current block keeps the ID of the original block it is a byte-for-byte copy of,
+ * and text an edit inserted is a note, numbered n0, n1, … @example
+ * stableBlockIds("e1", [{ type: "toolCall", id: "a" }, { type: "toolCall", id: "b" }], [{ type: "text", text: "note" }, { type: "toolCall", id: "b" }]) === ["e1.n0", "e1.c1"]
+ */
+function stableBlockIds(entryId: string, original: Block[], current: Block[]): string[] {
+	const originalIds = positionalBlockIds(entryId, original);
+	const originalKeys = original.map((block) => JSON.stringify(block));
+	const used = new Set<number>();
+	let notes = 0;
+	return current.map((block) => {
+		const key = JSON.stringify(block);
+		const index = originalKeys.findIndex((candidate, position) => !used.has(position) && candidate === key);
+		if (index < 0) return `${entryId}.n${notes++}`;
+		used.add(index);
+		return originalIds[index];
+	});
+}
+
+function blockIdsOf(entry: ProjectedEntry): string[] {
+	return stableBlockIds(entry.sourceEntry.id, asBlocks(originalContent(entry.sourceEntry)), asBlocks(entry.messages.at(-1)!.content));
+}
+
+function isEdited(entry: ProjectedEntry): boolean {
+	return JSON.stringify(entry.messages.at(-1)!.content) !== JSON.stringify(originalContent(entry.sourceEntry));
+}
+
+/** Editable entries whose latest edit removed them from context. */
+function removedEntries(projection: SessionProjection): ProjectedEntry[] {
+	const latestEdit = new Map<string, ContextEditEntry>();
+	for (const { sourceEntry } of projection.entries) if (sourceEntry.type === "context_edit") latestEdit.set(sourceEntry.targetId, sourceEntry);
+	return projection.entries.filter(({ sourceEntry, messages }) => messages.length === 0 && latestEdit.get(sourceEntry.id)?.replacement === null);
+}
+
+/** @example contentTokens("abcdefgh") === 2 */
+function contentTokens(content: unknown): number {
+	return asBlocks(content).reduce((total, block) => total + blockTokens(block), 0);
 }
 
 /** Pair each tool result with its call the way Pi replays them: the earliest unanswered call with that ID. */
@@ -112,6 +163,7 @@ function labelled(head: string, text: string): string {
 function entryHead(entry: ProjectedEntry, label: string): string {
 	const parts = [`${entry.sourceEntry.id} ${label}`, entry.sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(entryTokens(entry))} tokens`];
 	if (!isEditable(entry.sourceEntry)) parts.push("not editable");
+	if (isEditable(entry.sourceEntry) && isEdited(entry)) parts.push("edited");
 	return parts.join(", ");
 }
 
@@ -120,7 +172,9 @@ function outlineOf(projection: SessionProjection): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
-	const lines = [`${visible.length} entries, ~${formatTokens(totalTokens(projection))} tokens total`];
+	const removed = removedEntries(projection).length;
+	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
+	const lines = [`${visible.length} entries shown, ~${formatTokens(totalTokens(projection))} tokens total${removedNote}`];
 	for (const entry of visible) {
 		if (nestedResults.has(entry)) continue;
 		const message = entry.messages.at(-1)!;
@@ -130,9 +184,10 @@ function outlineOf(projection: SessionProjection): string {
 			continue;
 		}
 		lines.push(`- ${entryHead(entry, "assistant")}`);
-		const ids = blockIds(entry.sourceEntry.id, message.content);
+		const ids = blockIdsOf(entry);
 		message.content.forEach((block: Block, index: number) => {
-			const head = `${ids[index]} ${block.type === "toolCall" ? "call" : block.type}, ~${formatTokens(blockTokens(block))} tokens`;
+			const kind = block.type === "toolCall" ? "call" : ids[index].includes(".n") ? "note" : block.type;
+			const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} tokens`;
 			if (block.type === "thinking") lines.push(`  - ${head}${block.thinkingSignature ? ", signed" : ""}`);
 			else if (block.type === "toolCall") lines.push(`  - ${labelled(head, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
 			else lines.push(`  - ${labelled(head, block.text ?? "")}`);
@@ -141,6 +196,19 @@ function outlineOf(projection: SessionProjection): string {
 		});
 	}
 	return lines.join("\n");
+}
+
+/** The entries edits removed from context, with their original size and first line, for restore. */
+function removedOutlineOf(projection: SessionProjection): string {
+	const removed = removedEntries(projection);
+	if (removed.length === 0) return "No entries are removed by edits.";
+	const lines = removed.map(({ sourceEntry }) => {
+		const content = originalContent(sourceEntry);
+		const role = sourceEntry.type === "message" ? sourceEntry.message.role : "custom";
+		const head = `${sourceEntry.id} ${role}, ${sourceEntry.timestamp.slice(5, 16).replace("T", " ")}, ~${formatTokens(contentTokens(content))} tokens`;
+		return `- ${labelled(head, textOf(content))}`;
+	});
+	return [`${removed.length} entr${removed.length === 1 ? "y" : "ies"} removed by edits; {"restore": id} brings one back:`, ...lines].join("\n");
 }
 
 /** The projection Pi would build after appending the edits, through Pi's own validation, as its turn boundary does. */
@@ -193,7 +261,7 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 	const resolveBlock = (blockId: string): { entry: ProjectedEntry; block: Block } => {
 		const entry = editableEntry(blockId.split(".")[0]);
 		const content = entry.messages.at(-1)!.content as Block[];
-		const index = blockIds(entry.sourceEntry.id, content).indexOf(blockId);
+		const index = blockIdsOf(entry).indexOf(blockId);
 		if (index < 0) throw new Error(`${blockId} is not a block of ${entry.sourceEntry.id}; use a block ID from context_outline`);
 		return { entry, block: content[index] };
 	};
@@ -202,14 +270,34 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 		workingContent.set(id, (workingContent.get(id) ?? (entry.messages.at(-1)!.content as Block[])).flatMap(rewrite));
 	};
 
+	const restorable = (entry: ProjectedEntry): boolean => entry.messages.length === 0 || isEdited(entry);
+	const restore = (entry: ProjectedEntry): void => {
+		replacements.set(entry.sourceEntry.id, { content: originalContent(entry.sourceEntry) as ContextEditableContent });
+	};
+
 	for (const operation of operations) {
-		if ("dropThinking" in operation) {
+		if ("restore" in operation) {
+			const entry = base.entries.find(({ sourceEntry }) => sourceEntry.id === operation.restore);
+			if (!entry || !isEditable(entry.sourceEntry)) throw new Error(`${operation.restore} is not an editable entry in this session's context`);
+			if (!restorable(entry)) throw new Error(`${operation.restore} is not edited; there is nothing to restore`);
+			restore(entry);
+			// A restored call needs its result back too, or it would be left unanswered.
+			const original = asBlocks(originalContent(entry.sourceEntry));
+			const callIds = new Set(original.filter((block) => block.type === "toolCall").map((block) => block.id));
+			const position = base.entries.indexOf(entry);
+			for (const candidate of base.entries.slice(position + 1)) {
+				const source = candidate.sourceEntry;
+				if (source.type !== "message" || source.message.role !== "toolResult" || !callIds.has(source.message.toolCallId)) continue;
+				callIds.delete(source.message.toolCallId);
+				if (restorable(candidate)) restore(candidate);
+			}
+		} else if ("dropThinking" in operation) {
 			const beforeIndex = visible.findIndex((entry) => entry.sourceEntry.id === operation.dropThinking.before);
 			if (beforeIndex < 0) throw new Error(`${operation.dropThinking.before} is not in your current context`);
 			const kept = new Set(operation.dropThinking.except ?? []);
 			for (const entry of visible.slice(0, beforeIndex)) {
 				if (entry.messages.at(-1)!.role !== "assistant" || kept.has(entry.sourceEntry.id)) continue;
-				const ids = new Map((entry.messages.at(-1)!.content as Block[]).map((block, index) => [block, blockIds(entry.sourceEntry.id, entry.messages.at(-1)!.content)[index]]));
+				const ids = new Map((entry.messages.at(-1)!.content as Block[]).map((block, index) => [block, blockIdsOf(entry)[index]]));
 				rewriteBlocks(entry, (block) => (block.type === "thinking" && !kept.has(ids.get(block)!) ? [] : [block]));
 			}
 		} else if ("fold" in operation) {
@@ -248,7 +336,7 @@ function effectReport(base: SessionProjection, edited: SessionProjection, edits:
 	const before = totalTokens(base);
 	const after = totalTokens(edited);
 	return [
-		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. Frees ~${formatTokens(before - after)} tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
+		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
 		`Earliest change: ${visible[earliest].sourceEntry.id}, entry ${earliest + 1} of ${visible.length}; ~${formatTokens(reprocessed)} tokens from there on are reprocessed without the prompt cache once.`,
 		"Every tool call still has its result.",
 	].join(" ");
@@ -257,6 +345,7 @@ function effectReport(base: SessionProjection, edited: SessionProjection, edits:
 /** @example operationLabel({ fold: "a1.c0", note: "x" }) === "fold a1.c0" */
 function operationLabel(operation: Operation): string {
 	if ("fold" in operation) return `fold ${operation.fold}`;
+	if ("restore" in operation) return `restore ${operation.restore}`;
 	if ("dropThinking" in operation) return `dropThinking before ${operation.dropThinking.before}`;
 	return `${operation.replacement === null ? "remove" : "replace"} ${operation.id}`;
 }
@@ -277,11 +366,13 @@ const contextOutlineTool = defineTool({
 	label: "Context Outline",
 	description: [
 		"Outline your current context window. Each entry is a bullet: entry ID, role, time, estimated tokens, and the first line of its text.",
-		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text) and .c0 (call), and each tool result is nested under its call.",
+		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
+		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
 	].join(" "),
-	parameters: Type.Object({}),
-	async execute(_toolCallId, _parameters, _signal, _onUpdate, ctx) {
-		return { content: [{ type: "text" as const, text: outlineOf(ctx.sessionManager.buildSessionProjection()) }] };
+	parameters: Type.Object({ removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })) }),
+	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
+		const projection = ctx.sessionManager.buildSessionProjection();
+		return { content: [{ type: "text" as const, text: parameters.removed ? removedOutlineOf(projection) : outlineOf(projection) }] };
 	},
 });
 
@@ -293,6 +384,7 @@ const editContextTool = defineTool({
 		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
+		"{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
 		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
@@ -303,6 +395,7 @@ const editContextTool = defineTool({
 					Type.Object({ id: Type.String(), replacement: Type.Union([Type.String(), Type.Null()]) }),
 					Type.Object({ fold: Type.String(), note: Type.String() }),
 					Type.Object({ dropThinking: Type.Object({ before: Type.String(), except: Type.Optional(Type.Array(Type.String())) }) }),
+					Type.Object({ restore: Type.String() }),
 				]),
 				{ minItems: 1 },
 			),
