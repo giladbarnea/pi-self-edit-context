@@ -28,13 +28,30 @@ function textOf(content: unknown): string {
 	return content.map((block) => (block.type === "text" ? block.text : block.type === "toolCall" ? `→ ${block.name}(${JSON.stringify(block.arguments)})` : "")).join(" ");
 }
 
-/** @example blockSummary([{ type: "thinking" }, { type: "text" }, { type: "toolCall" }, { type: "toolCall" }]) === "[thinking+text+2 calls]" */
+/** @example formatTokens(950) === "950"; formatTokens(4123) === "4.1k" */
+function formatTokens(tokens: number): string {
+	return tokens < 1000 ? String(tokens) : `${(tokens / 1000).toFixed(1)}k`;
+}
+
+/** Characters a block sends, signatures included; Pi's estimate is about four characters per token. */
+function blockCharacters(block: any): number {
+	if (block.type === "thinking") return (block.thinking?.length ?? 0) + (block.thinkingSignature?.length ?? 0);
+	if (block.type === "toolCall") return block.name.length + JSON.stringify(block.arguments).length;
+	return block.text?.length ?? 0;
+}
+
+/** @example blockSummary([{ type: "thinking", thinking: "x".repeat(4000) }, { type: "toolCall", name: "a", arguments: {} }]) === "[thinking ~1.0k+1 call ~1]" */
 function blockSummary(content: unknown): string {
 	if (!Array.isArray(content)) return "";
+	const characters = new Map<string, number>();
 	const calls = content.filter((block) => block.type === "toolCall").length;
-	const kinds = [...new Set(content.map((block) => block.type).filter((type) => type !== "toolCall"))];
-	if (calls > 0) kinds.push(calls === 1 ? "1 call" : `${calls} calls`);
-	return kinds.length > 1 ? `[${kinds.join("+")}]` : "";
+	for (const block of content) characters.set(block.type, (characters.get(block.type) ?? 0) + blockCharacters(block));
+	if (characters.size < 2 && calls < 2) return "";
+	const parts = [...characters].map(([type, count]) => {
+		const label = type === "toolCall" ? (calls === 1 ? "1 call" : `${calls} calls`) : type;
+		return `${label} ~${formatTokens(Math.ceil(count / 4))}`;
+	});
+	return `[${parts.join("+")}]`;
 }
 
 /** @example previewOf("first line\nsecond") === "first line"; previewOf("a".repeat(150) + "b".repeat(150)) === "a".repeat(98) + "[…]" + "b".repeat(99) */
@@ -84,15 +101,18 @@ const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
 	description:
-		"List the messages in your current context window, one line each: entry ID, role, time, estimated tokens, block kinds, the call entry a tool result answers, and the first line of text. Use the IDs with edit_context.",
+		"List the messages in your current context window, one line each: entry ID, role, time, estimated tokens, block kinds, for a tool result the call it answers (entry ID, plus #n when the entry made several calls), and the first line of text. Use the IDs with edit_context.",
 	parameters: Type.Object({}),
 	async execute(_toolCallId, _parameters, _signal, _onUpdate, ctx) {
 		const projection = ctx.sessionManager.buildSessionProjection();
 		const visible = projection.entries.filter(({ messages }) => messages.length > 0);
-		const callEntryByCallId = new Map<string, string>();
+		const callByCallId = new Map<string, string>();
 		const lines = visible.map(({ sourceEntry, messages }) => {
 			const message = messages.at(-1)!;
-			if (message.role === "assistant") for (const block of message.content) if (block.type === "toolCall") callEntryByCallId.set(block.id, sourceEntry.id);
+			if (message.role === "assistant") {
+				const calls = message.content.filter((block) => block.type === "toolCall");
+				calls.forEach((call, index) => callByCallId.set(call.id, calls.length > 1 ? `${sourceEntry.id}#${index + 1}` : sourceEntry.id));
+			}
 			const tokens = messages.reduce((total, part) => total + estimateTokens(part), 0);
 			const fields = [
 				sourceEntry.id,
@@ -101,7 +121,7 @@ const contextOutlineTool = defineTool({
 				`~${tokens}tok`,
 				isEditable(sourceEntry) ? "" : "[not editable]",
 				blockSummary(message.content),
-				message.role === "toolResult" ? `answers ${callEntryByCallId.get(message.toolCallId) ?? "?"}` : "",
+				message.role === "toolResult" ? `answers ${callByCallId.get(message.toolCallId) ?? "?"}` : "",
 				previewOf(textOf(message.content)),
 			];
 			return fields.filter(Boolean).join(" ");

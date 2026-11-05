@@ -1,7 +1,7 @@
 // A deterministic stand-in for the model. It acts like an agent that edits its own context:
 // it reads the outline, picks targets by role and text, edits them, then records what it sees next.
 import { appendFileSync } from "node:fs";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type ScriptStep = (messages: any[]) => ReturnType<typeof fauxAssistantMessage>;
@@ -37,7 +37,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 	],
 	"outline-then-dry-run": [
-		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		() => fauxAssistantMessage([fauxThinking("t".repeat(4000)), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		(messages) => {
 			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");

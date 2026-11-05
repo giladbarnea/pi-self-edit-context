@@ -45,8 +45,11 @@ test("the outline gives a total and pairs each tool result with the entry holdin
 	assert.match(outline, /^\d+ entries, ~\d+ tokens total/, `outline header: ${outline.split("\n")[0]}`);
 	const callEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant");
 	assert.ok(outline, "no outline result reached the model");
-	const resultLine = outline.split("\n").find((line) => line.includes(" toolResult "));
-	assert.ok(resultLine?.includes(`answers ${callEntry.id}`), `result line should name call entry ${callEntry.id}: ${resultLine}`);
+	const resultLines = outline.split("\n").filter((line) => line.includes(" toolResult "));
+	assert.ok(resultLines[0]?.includes(`answers ${callEntry.id}#1`), `first result should answer call 1 of ${callEntry.id}: ${resultLines[0]}`);
+	assert.ok(resultLines[1]?.includes(`answers ${callEntry.id}#2`), `second result should answer call 2 of ${callEntry.id}: ${resultLines[1]}`);
+	const callLine = outline.split("\n").find((line) => line.startsWith(callEntry.id));
+	assert.match(callLine, /thinking ~1\.0k/, `4,000 characters of thinking should show as ~1.0k tokens: ${callLine}`);
 });
 
 test("a dry run reports the outcome without changing the context", () => {
