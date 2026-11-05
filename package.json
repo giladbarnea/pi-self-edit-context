@@ -1,0 +1,13 @@
+{
+  "name": "@giladbarnea/pi-self-edit-context",
+  "version": "0.0.0",
+  "description": "Let a Pi agent edit its own context window mid-run.",
+  "keywords": ["pi-package", "pi", "pi-agent", "pi-coding-agent", "context-window"],
+  "author": "Gilad Barnea",
+  "license": "MIT",
+  "type": "module",
+  "files": ["index.ts"],
+  "scripts": { "test": "node --test test/" },
+  "peerDependencies": { "@earendil-works/pi-ai": "*", "@earendil-works/pi-coding-agent": "*" },
+  "pi": { "extensions": ["./index.ts"] }
+}
