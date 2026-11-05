@@ -276,7 +276,7 @@ const editContextTool = defineTool({
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
-		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. Use dryRun to see the effect first; it returns a plan ID, and {apply: planId} commits that plan without resending it.",
+		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, and confirms every tool call still has its result; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
 	parameters: Type.Object({
 		operations: Type.Optional(
