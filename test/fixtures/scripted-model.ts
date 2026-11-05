@@ -20,44 +20,88 @@ function outlineId(outline: string, role: string, textFragment: string): string 
 	return line.trim().split(" ")[1];
 }
 
+function assistantEntryIds(outline: string): string[] {
+	return outline.split("\n").flatMap((line) => line.match(/^- (\S+) assistant/)?.[1] ?? []);
+}
+
 function recordContext(messages: any[]): void {
 	appendFileSync(logPath, JSON.stringify(messages.filter((message) => message.role !== "system")) + "\n");
 }
 
+function signedThinking(label: string) {
+	return { ...fauxThinking(label + "t".repeat(400 - label.length)), thinkingSignature: "s".repeat(3600) };
+}
+
+const outline = () => fauxAssistantMessage(fauxToolCall("context_outline", {}));
+const record: ScriptStep = (messages) => {
+	recordContext(messages);
+	return fauxAssistantMessage("done");
+};
+
 const scripts: Record<string, ScriptStep[]> = {
 	"pirate-first-request": [
-		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		outline,
 		(messages) => {
 			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
-			return fauxAssistantMessage(fauxToolCall("edit_context", { edits: [{ id, replacement: "Arr, PIRATE-REQUEST, matey" }] }));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id, replacement: "Arr, PIRATE-REQUEST, matey" }] }));
 		},
-		(messages) => {
-			recordContext(messages);
-			return fauxAssistantMessage("done");
-		},
+		record,
 	],
 	"outline-then-dry-run": [
-		() => fauxAssistantMessage([fauxThinking("t".repeat(4000)), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
-		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {}), fauxToolCall("context_outline", {})]),
+		outline,
 		(messages) => {
 			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
-			return fauxAssistantMessage(fauxToolCall("edit_context", { edits: [{ id, replacement: "short" }], dryRun: true }));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id, replacement: "short" }], dryRun: true }));
+		},
+		record,
+	],
+	"dry-run-then-apply": [
+		outline,
+		(messages) => {
+			const id = outlineId(lastToolResultText(messages), "user", "ORIGINAL-REQUEST");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id, replacement: "APPLIED-LATER" }], dryRun: true }));
 		},
 		(messages) => {
 			recordContext(messages);
-			return fauxAssistantMessage("done");
+			const planId = lastToolResultText(messages).match(/plan-\d+/)![0];
+			return fauxAssistantMessage(fauxToolCall("edit_context", { apply: planId }));
 		},
+		record,
+	],
+	"drop-thinking": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-B"), fauxToolCall("context_outline", {})]),
+		() => fauxAssistantMessage([signedThinking("THINK-C"), fauxToolCall("context_outline", {})]),
+		(messages) => {
+			const [first, second, third] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ dropThinking: { before: third, except: [second] } }] }));
+		},
+		record,
+	],
+	"fold-call": [
+		outline,
+		(messages) => {
+			const [first] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${first}.c0`, note: "FOLDED-NOTE" }] }));
+		},
+		record,
+	],
+	"replace-thinking-block": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), fauxToolCall("context_outline", {})]),
+		(messages) => {
+			const [first] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id: `${first}.t0`, replacement: "SHORT-NOTE" }] }));
+		},
+		record,
 	],
 	"orphan-tool-results": [
-		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		outline,
 		(messages) => {
 			const id = outlineId(lastToolResultText(messages), "assistant", "");
-			return fauxAssistantMessage(fauxToolCall("edit_context", { edits: [{ id, replacement: null }] }));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ id, replacement: null }] }));
 		},
-		(messages) => {
-			recordContext(messages);
-			return fauxAssistantMessage("done");
-		},
+		record,
 	],
 };
 
