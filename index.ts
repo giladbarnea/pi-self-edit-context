@@ -25,6 +25,8 @@ const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", 
 const PREVIEW_CHARACTERS = 200;
 const DEFAULT_MIN_TOKENS = 2000;
 const OUTLINE_TOOL = "context_outline";
+/** A restore that makes more than this many estimated tokens lose the prompt cache must be dry-run first and applied by plan. */
+const RESTORE_CONFIRM_TOKENS = 20_000;
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
 const EMPTIED_ASSISTANT_TEXT = "[thinking removed]";
 
@@ -264,27 +266,34 @@ function projectWithEdits(sessionManager: ReadonlySessionManager, edits: Context
 	return preview.buildSessionProjection();
 }
 
-/** Problems that would make the edited context unsendable; the newest assistant's calls are still running. */
+/** Problems that would make the edited context unsendable, naming entry and block IDs; the newest assistant's calls are still running. */
 function contextProblems(projection: SessionProjection): string[] {
 	// Pi does not replay failed or aborted assistant attempts, so their unanswered calls are not problems.
-	const messages = projection.messages.filter(
-		(message) => message.role !== "system" && !(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")),
+	const sent = projection.entries.flatMap((entry) =>
+		entry.messages
+			.filter((message) => message.role !== "system" && !(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")))
+			.map((message) => ({ entry, message })),
 	);
 	const problems: string[] = [];
-	if (messages.length > 0 && !USER_ROLES.has(messages[0].role)) problems.push(`the context would start with a ${messages[0].role} message instead of a user message`);
-	const lastAssistantIndex = messages.findLastIndex((message) => message.role === "assistant");
-	const openCalls = new Set<string>();
-	messages.forEach((message, index) => {
+	if (sent.length > 0 && !USER_ROLES.has(sent[0].message.role)) {
+		problems.push(`the context would start with ${sent[0].entry.sourceEntry.id}, a ${sent[0].message.role} message, instead of a user message`);
+	}
+	const lastAssistantIndex = sent.findLastIndex(({ message }) => message.role === "assistant");
+	const openCalls = new Map<string, string>();
+	sent.forEach(({ entry, message }, index) => {
 		if (message.role === "assistant") {
-			for (const callId of openCalls) problems.push(`tool call ${callId} would lose its tool result`);
+			for (const blockId of openCalls.values()) problems.push(`call ${blockId} would lose its result`);
 			openCalls.clear();
-			for (const block of message.content) if (block.type === "toolCall" && index !== lastAssistantIndex) openCalls.add(block.id);
+			const ids = blockIdsOf(entry);
+			message.content.forEach((block: Block, blockIndex: number) => {
+				if (block.type === "toolCall" && index !== lastAssistantIndex) openCalls.set(block.id, ids[blockIndex]);
+			});
 		}
 		if (message.role === "toolResult" && !openCalls.delete(message.toolCallId) && index < lastAssistantIndex) {
-			problems.push(`tool result for ${message.toolCallId} would lose its tool call`);
+			problems.push(`result ${entry.sourceEntry.id} would lose its call`);
 		}
 	});
-	for (const callId of openCalls) problems.push(`tool call ${callId} would lose its tool result`);
+	for (const blockId of openCalls.values()) problems.push(`call ${blockId} would lose its result`);
 	return problems;
 }
 
@@ -409,17 +418,44 @@ function outlineCalls(base: SessionProjection): OutlineCall[] {
 	});
 }
 
-/** The note a folded outline leaves: what the batch removed, and how to get the outline back. */
-function foldedOutlineNote(base: SessionProjection, edits: ContextEdit[], outline: OutlineCall): string {
-	const visible = visibleEntries(base);
-	const removedIds = new Set(edits.filter(({ replacement }) => replacement === null).map(({ targetId }) => targetId));
-	const removed = visible.filter((entry) => removedIds.has(entry.sourceEntry.id));
-	const changed = edits.length - removed.length;
-	const removedPart = removed.length === 0
-		? "removed no entries"
-		: `removed ${removed.length} entr${removed.length === 1 ? "y" : "ies"} (${removed[0].sourceEntry.id} → ${removed.at(-1)!.sourceEntry.id}, ~${formatTokens(removed.reduce((total, entry) => total + entryTokens(entry), 0))} est.)`;
-	const time = new Date().toISOString().slice(11, 16);
-	return `[${OUTLINE_TOOL} result folded when edits applied at ${time}. Those edits ${removedPart} and changed ${changed}. {"restore": "${outline.entry.sourceEntry.id}"} brings this outline back; context_outline {"removed": true} lists removed entries.]`;
+/** @example outlineSummary("12 entries shown (~3.1k est.), 2 removed by edits") === "showed 12 entries (~3.1k est.)" */
+function outlineSummary(text: string): string {
+	const shown = text.match(/^(\d+) entries shown \((~[^)]+)\)/);
+	if (shown) return `showed ${shown[1]} entries (${shown[2]})`;
+	const removed = text.match(/^(\d+) entr(?:y|ies) removed by edits/);
+	return removed ? `listed ${removed[1]} entries removed by edits` : "listed no removed entries";
+}
+
+/**
+ * Entries an outline listed that are removed once the batch applies: those whose latest removal came after the outline was taken.
+ * Entries already removed when it was taken are not in it; other outlines' results have notes of their own.
+ */
+function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall): SessionEntry[] {
+	const outlineIndex = base.entries.indexOf(outline.result);
+	const latestEdit = new Map<string, { index: number; replacement: ContextEditEntry["replacement"] }>();
+	base.entries.forEach(({ sourceEntry }, index) => {
+		if (sourceEntry.type === "context_edit") latestEdit.set(sourceEntry.targetId, { index, replacement: sourceEntry.replacement });
+	});
+	for (const { targetId, replacement } of batch) latestEdit.set(targetId, { index: base.entries.length, replacement });
+	return base.entries
+		.slice(0, outlineIndex)
+		.map(({ sourceEntry }) => sourceEntry)
+		.filter((entry) => {
+			if (!isEditable(entry) || (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === OUTLINE_TOOL)) return false;
+			const edit = latestEdit.get(entry.id);
+			return edit !== undefined && edit.index > outlineIndex && edit.replacement === null;
+		});
+}
+
+/** The note a folded outline leaves: what it showed, which of its entries are removed, and how to get it back. */
+function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall): string {
+	const taken = outline.result.sourceEntry.timestamp.slice(11, 16);
+	const summary = outlineSummary(textOf(outline.result.messages.at(-1)!.content));
+	const removed = removedSinceOutline(base, batch, outline);
+	const size = formatTokens(removed.reduce((total, entry) => total + contentTokens(originalContent(entry)), 0));
+	const which = removed.length === 1 ? removed[0].id : `the earliest ${removed[0]?.id}, the latest ${removed.at(-1)?.id}`;
+	const removedPart = removed.length === 0 ? "None of the entries it lists are removed." : `Edits since then removed ${removed.length} of the entries it lists (~${size} est.): ${which}.`;
+	return `[${OUTLINE_TOOL} result folded. It was taken at ${taken} and ${summary}. ${removedPart} {"restore": "${outline.entry.sourceEntry.id}"} brings this outline back; context_outline {"removed": true} lists every removed entry.]`;
 }
 
 /**
@@ -442,19 +478,25 @@ function withOutlineFolds(base: SessionProjection, operations: Operation[], edit
 	return { edits: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
 }
 
-/** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
-function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): string {
+/** Where the edits break the prompt cache, and how many estimated tokens from there on are reprocessed once. */
+function cacheBreak(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): { earliest: number; entries: number; reprocessed: number } {
 	const visible = visibleEntries(base);
 	const earliest = earliestChange(base, edits);
 	const positionById = new Map(visible.map((entry, index) => [entry.sourceEntry.id, index]));
 	const reprocessed = visibleEntries(edited)
 		.filter((entry) => (positionById.get(entry.sourceEntry.id) ?? Infinity) >= earliest)
 		.reduce((total, entry) => total + entryTokens(entry), 0);
+	return { earliest, entries: visible.length, reprocessed };
+}
+
+/** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
+function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): string {
+	const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits);
 	const before = totalTokens(base);
 	const after = totalTokens(edited);
 	return [
 		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} est. tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
-		`Earliest change: ${visible[earliest].sourceEntry.id}, entry ${earliest + 1} of ${visible.length}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
+		`Earliest change: ${visibleEntries(base)[earliest].sourceEntry.id}, entry ${earliest + 1} of ${entries}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
 		"Every tool call still has its result.",
 	].join(" ");
 }
@@ -507,9 +549,9 @@ const editContextTool = defineTool({
 		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
-		"{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result.",
+		`{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result. A restore that makes more than ${formatTokens(RESTORE_CONFIRM_TOKENS)} est. tokens lose the prompt cache must be dry-run first and applied by plan.`,
 		"{foldRange: {from: entryId, to: entryId, note}}: replace a contiguous stretch of entries with one note you write; its first user or assistant message holds the note and the rest are removed. A range that would split a call from its result is refused.",
-		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what was removed and how to restore it.",
+		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what the outline showed, which of its entries are removed, and how to restore it.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
 		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
@@ -552,6 +594,13 @@ const editContextTool = defineTool({
 		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
+		const restores = parameters.apply === undefined && !parameters.dryRun && (parameters.operations as Operation[]).some((operation) => "restore" in operation);
+		const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits);
+		if (restores && reprocessed > RESTORE_CONFIRM_TOKENS) {
+			throw new Error(
+				`Not applied: this restore makes ~${formatTokens(reprocessed)} est. tokens lose the prompt cache, from entry ${earliest + 1} of ${entries}. Dry-run it, then apply the plan if it is worth it.`,
+			);
+		}
 		const report = effectReport(base, edited, edits) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {

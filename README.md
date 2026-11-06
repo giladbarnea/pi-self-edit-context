@@ -14,15 +14,15 @@ Operations, by ID from the outline:
 - `{fold: callBlockId, note}`: replace a tool call with a note and remove its result, in one step.
 - `{dropThinking: {before: entryId, except?: [entry or block IDs]}}`: drop every thinking block in the entries before that entry, except the ones named.
 - `{foldRange: {from, to, note}}`: replace a contiguous stretch of entries with one note the agent writes. Its first user or assistant message holds the note; the rest are removed. A range that would split a call from its result is refused.
-- `{restore: entryId}`: bring an edited or removed entry back to its stored original. Restoring a call also restores its removed result. Restoring an unedited entry is refused, since it would only break the cache.
+- `{restore: entryId}`: bring an edited or removed entry back to its stored original. Restoring a call also restores its removed result. Restoring an unedited entry is refused, since it would only break the cache. A restore that makes more than 20k est. tokens lose the prompt cache must be dry-run first and applied by plan.
 
 `dryRun: true` reports the tokens freed, the earliest change and how many tokens after it lose the prompt cache once, and confirms every call still has its result. It returns a plan ID, and `{apply: planId}` commits that exact plan without resending it.
 
-Edits are refused, and change nothing, if they would leave a call without its result or the reverse, make the context start with a non-user message, or touch the agent's current message.
+Edits are refused, and change nothing, naming the entry or block at fault, if they would leave a call without its result or the reverse, make the context start with a non-user message, or touch the agent's current message.
 
 ## Outlines fold themselves
 
-When edits apply, earlier `context_outline` results after the batch's earliest change are folded in the same batch. They lose the prompt cache anyway, so this costs nothing. Outlines before the earliest change are left, and the report names them, since folding one would move the cache break earlier. Each folded outline leaves a note: how many entries the batch removed, their bounds and size, and `{"restore": entryId}` to bring the outline back. Restoring it shows what the agent saw and the IDs it needs to restore the removed entries themselves.
+When edits apply, earlier `context_outline` results after the batch's earliest change are folded in the same batch. They lose the prompt cache anyway, so this costs nothing. Outlines before the earliest change are left, and the report names them, since folding one would move the cache break earlier. Each folded outline leaves a note: when it was taken and what it showed, which of the entries it lists are now removed (counted from the session, so the note stays accurate when an outline is restored and folded again), and `{"restore": entryId}` to bring it back. Restoring it shows what the agent saw and the IDs it needs to restore the removed entries themselves.
 
 ## How it works
 

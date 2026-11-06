@@ -1,7 +1,7 @@
 // A deterministic stand-in for the model. It acts like an agent that edits its own context:
 // it reads the outline, picks targets by role and text, edits them, then records what it sees next.
 import { appendFileSync } from "node:fs";
-import { fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type ScriptStep = (messages: any[]) => ReturnType<typeof fauxAssistantMessage>;
@@ -159,7 +159,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		(messages) => {
 			recordContext(messages);
-			const note = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.text?.includes("result folded when edits applied"));
+			const note = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.text?.includes("result folded"));
 			const restore = JSON.parse(note.text.match(/\{"restore": "\w+"\}/)[0]);
 			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [restore] }));
 		},
@@ -191,6 +191,53 @@ const scripts: Record<string, ScriptStep[]> = {
 		() => fauxAssistantMessage([signedThinking("THINK-A"), readNull()]),
 		() => fauxAssistantMessage(readNull()),
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
+		record,
+	],
+	"outline-trail": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const [readA] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${readA}.c0`, note: "A-NOTE" }] }));
+		},
+		outline,
+		(messages) => {
+			const [, readB] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${readB}.c0`, note: "B-NOTE" }] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const notes = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).filter((block) => block.text?.includes("result folded"));
+			const restore = JSON.parse(notes.at(-1).text.match(/\{"restore": "\w+"\}/)[0]);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [restore] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const foldA = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.arguments?.operations?.[0]?.note === "A-NOTE");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ restore: foldA.arguments.operations[0].fold.split(".")[0] }] }));
+		},
+		record,
+	],
+	"expensive-restore": [
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const [readA] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${readA}.c0`, note: "A-NOTE" }] }));
+		},
+		// About 25k estimated tokens after the restore point.
+		() => fauxAssistantMessage([fauxText("x".repeat(100_000)), readNull()]),
+		(messages) => {
+			const foldA = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.arguments?.operations?.[0]?.note === "A-NOTE");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ restore: foldA.arguments.operations[0].fold.split(".")[0] }] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const restoreCall = messages.findLast((message) => message.role === "assistant").content[0];
+			return fauxAssistantMessage(fauxToolCall("edit_context", { ...restoreCall.arguments, dryRun: true }));
+		},
+		(messages) => fauxAssistantMessage(fauxToolCall("edit_context", { apply: lastToolResultText(messages).match(/plan-\d+/)![0] })),
 		record,
 	],
 	"orphan-tool-results": [

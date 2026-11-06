@@ -187,9 +187,9 @@ test("applying edits folds earlier outlines after the earliest change, leaves ea
 	assert.match(report, new RegExp(`Left in place, before the earliest change: outline ${earlyOutline.id}\\.c0`), `report: ${report}`);
 	assert.ok(afterEdit.some((message) => message.role === "toolResult" && message.toolCallId === earlyOutline.message.content[0].id), "the outline before the earliest change must stay, or the cache break moves earlier");
 	assert.ok(!afterEdit.some((message) => message.role === "toolResult" && message.toolCallId === lateOutline.message.content[0].id), "the outline after the earliest change should be folded");
-	const note = textOf(afterEdit.find((message) => message.role === "assistant" && textOf(message).includes("result folded when edits applied")));
+	const note = textOf(afterEdit.find((message) => message.role === "assistant" && textOf(message).includes("result folded")));
 	const readResult = resultOf(read);
-	assert.match(note, new RegExp(`removed 1 entry \\(${readResult.id} → ${readResult.id}, ~\\d+ est\\.\\)`), `note should name what the batch removed: ${note}`);
+	assert.match(note, new RegExp(`removed 1 of the entries it lists \\(~\\d+ est\\.\\): ${readResult.id}\\.`), `note should name the removed entry it lists: ${note}`);
 	assert.match(note, new RegExp(`\\{"restore": "${lateOutline.id}"\\}`), `note should say how to restore the outline: ${note}`);
 	const restored = contextAfterEdit.find((message) => message.role === "toolResult" && message.toolCallId === lateOutline.message.content[0].id);
 	assert.deepEqual(restored?.content, resultOf(lateOutline).message.content, "restoring the note's entry should bring the outline back as stored");
@@ -210,7 +210,9 @@ test("a foldRange that would split a call from its result is refused and changes
 	const { contextAfterEdit, entries } = runAgent("fold-range-splits-exchange", "ORIGINAL-REQUEST: anything");
 	const refusal = contextAfterEdit.findLast((message) => message.role === "toolResult");
 	assert.equal(refusal.isError, true, `foldRange should refuse, got: ${textOf(refusal)}`);
-	assert.match(textOf(refusal), /would lose its tool call/);
+	const secondReadResult = messageEntries(entries, "toolResult")[1];
+	assert.match(textOf(refusal), new RegExp(`result ${secondReadResult.id} would lose its call`), `the refusal should name the stranded result's entry: ${textOf(refusal)}`);
+	assert.ok(!textOf(refusal).includes("tool:"), `the refusal should not name raw tool-call IDs: ${textOf(refusal)}`);
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a refused foldRange was persisted");
 });
 
@@ -230,5 +232,35 @@ test("an edit that would separate tool calls from their results is refused and c
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a broken edit was persisted");
 	const refusal = contextAfterEdit.findLast((message) => message.role === "toolResult");
 	assert.equal(refusal.isError, true, `edit_context should report an error, got: ${textOf(refusal)}`);
-	assert.match(textOf(refusal), /tool result/i);
+	const strandedResult = messageEntries(entries, "toolResult")[0];
+	assert.match(textOf(refusal), new RegExp(`result ${strandedResult.id} would lose its call`), `the refusal should name the stranded result's entry: ${textOf(refusal)}`);
+	assert.ok(!textOf(refusal).includes("tool:"), `the refusal should not name raw tool-call IDs: ${textOf(refusal)}`);
+});
+
+test("a re-folded outline's note still says which of its entries are removed, not just what the latest batch did", () => {
+	// readA and readB; edit 1 folds A; outline O2 is taken; edit 2 folds B and folds O2; the agent restores O2 from its note,
+	// then restores A, which folds O2 again. O2 never listed A's result, and B's result stays removed throughout.
+	const { contexts, entries } = runAgent("outline-trail", "ORIGINAL-REQUEST: anything");
+	const [, readB] = messageEntries(entries, "assistant");
+	const outlineEntries = messageEntries(entries, "assistant").filter((entry) => entry.message.content.some((block) => block.name === "context_outline"));
+	const secondOutline = outlineEntries[1];
+	const resultB = messageEntries(entries, "toolResult").find((entry) => entry.message.toolCallId === readB.message.content[0].id);
+	const noteOn = (context) => textOf(context.find((message) => message.role === "assistant" && message.content.some((block) => block.text?.includes(`{"restore": "${secondOutline.id}"}`))) ?? { content: [] });
+	for (const [label, context] of [["first fold", contexts[0]], ["fold after the round trip", contexts[2]]]) {
+		const note = noteOn(context);
+		assert.match(note, /It was taken at \d\d:\d\d and showed \d+ entries \(~[\d.]+k? est\.\)/, `${label}: the note should describe the outline itself: ${note}`);
+		assert.match(note, new RegExp(`removed 1 of the entries it lists \\(~\\d+ est\\.\\): ${resultB.id}\\.`), `${label}: the note should name B's result as the one removed entry it lists: ${note}`);
+	}
+	assert.ok(contexts[1].some((message) => message.role === "toolResult" && message.toolCallId === secondOutline.message.content[0].id), "the note's restore should have brought the outline back");
+});
+
+test("a restore that breaks the cache far back must be dry-run first, and then applies by plan", () => {
+	const { contexts, contextAfterEdit, entries } = runAgent("expensive-restore", "ORIGINAL-REQUEST: anything");
+	const readA = messageEntries(entries, "assistant")[0];
+	const refusal = contexts[0].findLast((message) => message.role === "toolResult");
+	assert.equal(refusal.isError, true, `a direct restore breaking ~25k est. should be refused: ${textOf(refusal)}`);
+	assert.match(textOf(refusal), /~2\d(\.\d)?k est\. tokens lose the prompt cache/, `refusal should give the cost: ${textOf(refusal)}`);
+	assert.match(textOf(refusal), /dry-run/i);
+	assert.equal(entries.filter((entry) => entry.type === "context_edit" && entry.targetId === readA.id).length, 2, "the fold and the planned restore only; the refused restore must not persist");
+	assert.deepEqual(contextAfterEdit.find((message) => message.role === "assistant").content, readA.message.content, "applying the plan should restore the read");
 });
