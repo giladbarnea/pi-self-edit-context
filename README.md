@@ -14,9 +14,11 @@ Operations, by ID from the outline:
 - `{fold: callBlockId, note}`: replace a tool call with a note and remove its result, in one step.
 - `{dropThinking: {before: entryId, except?: [entry or block IDs]}}`: drop every thinking block in the entries before that entry, except the ones named.
 - `{foldRange: {from, to, note}}`: replace a contiguous stretch of entries with one note the agent writes. Its first user or assistant message holds the note; the rest are removed. A range that would split a call from its result is refused.
-- `{restore: entryId}`: bring an edited or removed entry back to its stored original. Restoring a call also restores its removed result. Restoring an unedited entry is refused, since it would only break the cache. A restore that makes more than 20k est. tokens lose the prompt cache must be dry-run first and applied by plan.
+- `{restore: entryId}`: bring an edited or removed entry back to its stored original. A call entry comes back with its results, and a result comes back with the entry holding its call, so a restore is always sendable.
 
-`dryRun: true` reports the tokens freed, the earliest change and how many tokens after it lose the prompt cache once, and confirms every call still has its result. It returns a plan ID, and `{apply: planId}` commits that exact plan without resending it.
+Operations in one batch apply in order to a working copy of the context: `[{restore: E}, {fold: "E.c1"}]` restores E, then folds its second call. The batch's edits are the entries whose final content differs from the current context; a batch that changes nothing is refused.
+
+Every report, dry run or not, gives the tokens freed, the earliest change and how many tokens after it lose the prompt cache once, and confirms every call still has its result. It returns a plan ID, and `{apply: planId}` commits that exact plan without resending it.
 
 Edits are refused, and change nothing, naming the entry or block at fault, if they would leave a call without its result or the reverse, make the context start with a non-user message, or touch the agent's current message.
 
@@ -29,3 +31,5 @@ When edits apply, earlier `context_outline` results after the batch's earliest c
 Edits are queued and returned from Pi's `turn_end` boundary as native `context_edit` entries. Pi validates and appends them, then rebuilds the running agent's context, so they apply from the next request in the same run and survive resume. The session file keeps every original message.
 
 Test: `npm test` runs real `pi -p` sessions against a scripted stand-in model; no model calls.
+
+`test/monkey.test.mjs` drives a seeded random agent through ~40 batches of folds, ranges, restores, thinking drops and block edits, valid or not, often using IDs remembered from older outlines, then restores everything. It checks that every request stays sendable, refusals and dry runs persist nothing, folds remove the result of the call their ID originally named, outline counts agree with the removed list, and full restore brings every message back byte for byte. `MONKEY_SEEDS=1,2,…` and `MONKEY_ACTS=n` widen the search.

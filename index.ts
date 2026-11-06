@@ -25,10 +25,9 @@ const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", 
 const PREVIEW_CHARACTERS = 200;
 const DEFAULT_MIN_TOKENS = 2000;
 const OUTLINE_TOOL = "context_outline";
-/** A restore that makes more than this many estimated tokens lose the prompt cache must be dry-run first and applied by plan. */
-const RESTORE_CONFIRM_TOKENS = 20_000;
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
-const EMPTIED_ASSISTANT_TEXT = "[thinking removed]";
+/** What an entry holds when edits remove every block in it, since Pi cannot send an empty message. */
+const EMPTIED_TEXT = "[content removed]";
 
 /** Edits queued this turn. Pi persists them at the turn boundary, before the next request. */
 const pendingEditsBySession = new Map<string, ContextEdit[]>();
@@ -297,102 +296,110 @@ function contextProblems(projection: SessionProjection): string[] {
 	return problems;
 }
 
-/** Turn the agent's operations into one replacement per entry, resolved against the current context. Throws on any invalid operation. */
-function compileOperations(base: SessionProjection, operations: Operation[]): ContextEdit[] {
-	const visible = visibleEntries(base);
-	const entryById = new Map(visible.map((entry) => [entry.sourceEntry.id, entry]));
-	const latestAssistant = visible.findLast((entry) => entry.messages.at(-1)!.role === "assistant");
-	const resultByCall = pairResults(visible);
-	const replacements = new Map<string, ContextEditEntry["replacement"]>();
-	const workingContent = new Map<string, Block[]>();
+type Content = Block[] | string | null;
 
-	const editableEntry = (id: string): ProjectedEntry => {
-		const entry = entryById.get(id);
-		if (!entry) throw new Error(`${id} is not in your current context; use an ID from context_outline`);
-		if (!isEditable(entry.sourceEntry)) throw new Error(`${id} cannot be edited; only user, assistant, tool-result and custom messages can`);
+/**
+ * Turn the agent's operations into context edits. Operations apply in order to a working copy of the context, so a later
+ * operation sees what earlier ones did; the edits are the entries whose final content differs from the current context.
+ * Throws on any invalid operation.
+ */
+function compileOperations(base: SessionProjection, operations: Operation[]): ContextEdit[] {
+	const byId = new Map(base.entries.map((entry) => [entry.sourceEntry.id, entry]));
+	const latestAssistant = visibleEntries(base).findLast((entry) => entry.messages.at(-1)!.role === "assistant");
+	const currentOf = (entry: ProjectedEntry): Content => (entry.messages.length > 0 ? (entry.messages.at(-1)!.content as Block[] | string) : null);
+	const working = new Map<string, Content>();
+	const contentOf = (entry: ProjectedEntry): Content => (working.has(entry.sourceEntry.id) ? working.get(entry.sourceEntry.id)! : currentOf(entry));
+	const set = (entry: ProjectedEntry, content: Content): void => void working.set(entry.sourceEntry.id, content);
+	const roleOf = (entry: ProjectedEntry): string => (entry.sourceEntry.type === "message" ? entry.sourceEntry.message.role : "custom");
+	const asText = (entry: ProjectedEntry, text: string): Content => (roleOf(entry) === "assistant" ? [{ type: "text", text }] : text);
+
+	const editable = (id: string): ProjectedEntry => {
+		const entry = byId.get(id);
+		if (!entry || !isEditable(entry.sourceEntry)) throw new Error(`${id} is not an editable entry in this session's context`);
 		if (entry === latestAssistant) throw new Error(`${id} is your current message, whose call is still running; it cannot be edited`);
 		return entry;
 	};
-	const resolveBlock = (blockId: string): { entry: ProjectedEntry; block: Block } => {
-		const entry = editableEntry(blockId.split(".")[0]);
-		const content = entry.messages.at(-1)!.content as Block[];
-		const index = blockIdsOf(entry).indexOf(blockId);
+	const present = (id: string): ProjectedEntry => {
+		const entry = editable(id);
+		if (contentOf(entry) === null) throw new Error(`${id} is not in your current context; use an ID from context_outline`);
+		return entry;
+	};
+	const blocksOf = (entry: ProjectedEntry): Block[] => asBlocks(contentOf(entry));
+	const resolveBlock = (blockId: string): { entry: ProjectedEntry; blocks: Block[]; index: number } => {
+		const entry = present(blockId.split(".")[0]);
+		const blocks = blocksOf(entry);
+		const index = stableBlockIds(entry.sourceEntry.id, asBlocks(originalContent(entry.sourceEntry)), blocks).indexOf(blockId);
 		if (index < 0) throw new Error(`${blockId} is not a block of ${entry.sourceEntry.id}; use a block ID from context_outline`);
-		return { entry, block: content[index] };
+		return { entry, blocks, index };
 	};
-	const rewriteBlocks = (entry: ProjectedEntry, rewrite: (block: Block) => Block[]): void => {
-		const id = entry.sourceEntry.id;
-		workingContent.set(id, (workingContent.get(id) ?? (entry.messages.at(-1)!.content as Block[])).flatMap(rewrite));
-	};
-
-	const restorable = (entry: ProjectedEntry): boolean => entry.messages.length === 0 || isEdited(entry);
-	const restore = (entry: ProjectedEntry): void => {
-		replacements.set(entry.sourceEntry.id, { content: originalContent(entry.sourceEntry) as ContextEditableContent });
+	const position = new Map(base.entries.map((entry, index) => [entry, index]));
+	const resultOfCall = (callEntry: ProjectedEntry, callId: string): ProjectedEntry | undefined =>
+		base.entries.slice(position.get(callEntry)! + 1).find(({ sourceEntry }) => sourceEntry.type === "message" && sourceEntry.message.role === "toolResult" && sourceEntry.message.toolCallId === callId);
+	const callEntryOfResult = (resultEntry: ProjectedEntry): ProjectedEntry | undefined => {
+		const source = resultEntry.sourceEntry;
+		if (source.type !== "message" || source.message.role !== "toolResult") return undefined;
+		const callId = source.message.toolCallId;
+		return base.entries.slice(0, position.get(resultEntry)).findLast((entry) => asBlocks(originalContent(entry.sourceEntry)).some((block) => block.type === "toolCall" && block.id === callId));
 	};
 
 	for (const operation of operations) {
 		if ("restore" in operation) {
-			const entry = base.entries.find(({ sourceEntry }) => sourceEntry.id === operation.restore);
-			if (!entry || !isEditable(entry.sourceEntry)) throw new Error(`${operation.restore} is not an editable entry in this session's context`);
-			if (!restorable(entry)) throw new Error(`${operation.restore} is not edited; there is nothing to restore`);
-			restore(entry);
-			// A restored call needs its result back too, or it would be left unanswered.
-			const original = asBlocks(originalContent(entry.sourceEntry));
-			const callIds = new Set(original.filter((block) => block.type === "toolCall").map((block) => block.id));
-			const position = base.entries.indexOf(entry);
-			for (const candidate of base.entries.slice(position + 1)) {
-				const source = candidate.sourceEntry;
-				if (source.type !== "message" || source.message.role !== "toolResult" || !callIds.has(source.message.toolCallId)) continue;
-				callIds.delete(source.message.toolCallId);
-				if (restorable(candidate)) restore(candidate);
-			}
+			const target = editable(operation.restore);
+			// A result comes back with the entry holding its call; a call entry comes back with its results.
+			const entry = callEntryOfResult(target) ?? target;
+			if (entry === latestAssistant) throw new Error(`${operation.restore} belongs to your current message, whose call is still running`);
+			const results = asBlocks(originalContent(entry.sourceEntry))
+				.filter((block) => block.type === "toolCall")
+				.flatMap((call) => resultOfCall(entry, call.id) ?? []);
+			for (const candidate of [entry, ...results]) set(candidate, originalContent(candidate.sourceEntry) as Content);
 		} else if ("foldRange" in operation) {
 			const { from, to, note } = operation.foldRange;
-			const start = visible.findIndex((entry) => entry.sourceEntry.id === from);
-			const end = visible.findIndex((entry) => entry.sourceEntry.id === to);
-			if (start < 0 || end < 0) throw new Error(`foldRange bounds must be entry IDs in your current context; got ${from} → ${to}`);
+			const start = position.get(present(from))!;
+			const end = position.get(present(to))!;
 			if (end < start) throw new Error(`foldRange ${from} → ${to} ends before it starts`);
 			// Entries Pi cannot edit, such as tool-declaration system messages, stay where they are.
-			const range = visible.slice(start, end + 1).filter((entry) => isEditable(entry.sourceEntry));
-			const carrier = range.find((entry) => entry.messages.at(-1)!.role !== "toolResult");
+			const range = base.entries.slice(start, end + 1).filter((entry) => isEditable(entry.sourceEntry) && contentOf(entry) !== null);
+			const carrier = range.find((entry) => roleOf(entry) !== "toolResult");
 			if (!carrier) throw new Error(`foldRange ${from} → ${to} has no user or assistant message to hold the note`);
-			for (const entry of range) {
-				editableEntry(entry.sourceEntry.id);
-				replacements.set(entry.sourceEntry.id, null);
-			}
-			const role = carrier.messages.at(-1)!.role;
-			replacements.set(carrier.sourceEntry.id, { content: role === "assistant" ? [{ type: "text", text: note }] : note });
+			for (const entry of range) set(editable(entry.sourceEntry.id), null);
+			set(carrier, asText(carrier, note));
 		} else if ("dropThinking" in operation) {
-			const beforeIndex = visible.findIndex((entry) => entry.sourceEntry.id === operation.dropThinking.before);
-			if (beforeIndex < 0) throw new Error(`${operation.dropThinking.before} is not in your current context`);
+			const before = position.get(present(operation.dropThinking.before))!;
 			const kept = new Set(operation.dropThinking.except ?? []);
-			for (const entry of visible.slice(0, beforeIndex)) {
-				if (entry.messages.at(-1)!.role !== "assistant" || kept.has(entry.sourceEntry.id)) continue;
-				const ids = new Map((entry.messages.at(-1)!.content as Block[]).map((block, index) => [block, blockIdsOf(entry)[index]]));
-				rewriteBlocks(entry, (block) => (block.type === "thinking" && !kept.has(ids.get(block)!) ? [] : [block]));
+			for (const entry of base.entries.slice(0, before)) {
+				if (roleOf(entry) !== "assistant" || entry === latestAssistant || contentOf(entry) === null || kept.has(entry.sourceEntry.id)) continue;
+				const blocks = blocksOf(entry);
+				const ids = stableBlockIds(entry.sourceEntry.id, asBlocks(originalContent(entry.sourceEntry)), blocks);
+				const keptBlocks = blocks.filter((block, index) => block.type !== "thinking" || kept.has(ids[index]));
+				if (keptBlocks.length !== blocks.length) set(entry, keptBlocks);
 			}
 		} else if ("fold" in operation) {
-			const { entry, block } = resolveBlock(operation.fold);
+			const { entry, blocks, index } = resolveBlock(operation.fold);
+			const block = blocks[index];
 			if (block.type !== "toolCall") throw new Error(`${operation.fold} is not a tool call; fold takes a call block ID such as ${entry.sourceEntry.id}.c0`);
-			const result = resultByCall.get(block);
-			if (!result) throw new Error(`${operation.fold} has no result in context to fold`);
-			rewriteBlocks(entry, (candidate) => (candidate === block ? [{ type: "text", text: operation.note }] : [candidate]));
-			replacements.set(result.sourceEntry.id, null);
+			const result = resultOfCall(entry, block.id);
+			if (!result || contentOf(result) === null) throw new Error(`${operation.fold} has no result in context to fold`);
+			set(entry, blocks.map((candidate, position) => (position === index ? { type: "text", text: operation.note } : candidate)));
+			set(result, null);
 		} else if (operation.id.includes(".")) {
-			const { entry, block } = resolveBlock(operation.id);
-			if (block.type === "toolCall") throw new Error(`${operation.id} is a tool call; use fold to replace a call together with its result`);
-			rewriteBlocks(entry, (candidate) => (candidate !== block ? [candidate] : operation.replacement === null ? [] : [{ type: "text", text: operation.replacement }]));
+			const { entry, blocks, index } = resolveBlock(operation.id);
+			if (blocks[index].type === "toolCall") throw new Error(`${operation.id} is a tool call; use fold to replace a call together with its result`);
+			const replacement = operation.replacement === null ? [] : [{ type: "text", text: operation.replacement }];
+			set(entry, [...blocks.slice(0, index), ...replacement, ...blocks.slice(index + 1)]);
 		} else {
-			editableEntry(operation.id);
-			replacements.set(operation.id, operation.replacement === null ? null : { content: operation.replacement });
+			const entry = present(operation.id);
+			set(entry, operation.replacement === null ? null : asText(entry, operation.replacement));
 		}
 	}
 
-	for (const [id, content] of workingContent) {
-		if (replacements.has(id)) continue;
-		replacements.set(id, { content: content.length > 0 ? content : [{ type: "text", text: EMPTIED_ASSISTANT_TEXT }] });
-	}
-	return [...replacements].map(([targetId, replacement]) => ({ targetId, replacement }));
+	return base.entries.flatMap((entry): ContextEdit[] => {
+		if (!working.has(entry.sourceEntry.id)) return [];
+		const content = working.get(entry.sourceEntry.id)!;
+		if (JSON.stringify(content) === JSON.stringify(currentOf(entry))) return [];
+		const emptied = Array.isArray(content) && content.length === 0;
+		const replacement = content === null ? null : { content: (emptied ? [{ type: "text", text: EMPTIED_TEXT }] : content) as ContextEditableContent };
+		return [{ targetId: entry.sourceEntry.id, replacement }];
+	});
 }
 
 /** Position of the earliest entry the edits change, in the current context. */
@@ -454,8 +461,9 @@ function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outlin
 	const removed = removedSinceOutline(base, batch, outline);
 	const size = formatTokens(removed.reduce((total, entry) => total + contentTokens(originalContent(entry)), 0));
 	const which = removed.length === 1 ? removed[0].id : `the earliest ${removed[0]?.id}, the latest ${removed.at(-1)?.id}`;
-	const removedPart = removed.length === 0 ? "None of the entries it lists are removed." : `Edits since then removed ${removed.length} of the entries it lists (~${size} est.): ${which}.`;
-	return `[${OUTLINE_TOOL} result folded. It was taken at ${taken} and ${summary}. ${removedPart} {"restore": "${outline.entry.sourceEntry.id}"} brings this outline back; context_outline {"removed": true} lists every removed entry.]`;
+	const removedPart = removed.length === 0 ? "none of the entries it lists were removed" : `${removed.length} of the entries it lists were removed (~${size} est.): ${which}`;
+	const folded = new Date().toISOString().slice(11, 16);
+	return `[${OUTLINE_TOOL} result folded at ${folded}. It was taken at ${taken} and ${summary}. When folded, ${removedPart}. {"restore": "${outline.entry.sourceEntry.id}"} brings this outline back; context_outline {"removed": true} lists every removed entry.]`;
 }
 
 /**
@@ -466,7 +474,8 @@ function withOutlineFolds(base: SessionProjection, operations: Operation[], edit
 	if (edits.length === 0) return { edits, note: "" };
 	const earliest = earliestChange(base, edits);
 	const targeted = new Set(edits.map(({ targetId }) => targetId));
-	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id));
+	// An outline the batch already changes, such as one it restores, is the agent's own choice; leave it.
+	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id) && !targeted.has(call.entry.sourceEntry.id));
 	const folded = calls.filter((call) => call.position > earliest);
 	const left = calls.filter((call) => call.position <= earliest);
 	const leftNote = left.length === 0
@@ -549,7 +558,7 @@ const editContextTool = defineTool({
 		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
-		`{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result. A restore that makes more than ${formatTokens(RESTORE_CONFIRM_TOKENS)} est. tokens lose the prompt cache must be dry-run first and applied by plan.`,
+		`{restore: entryId}: bring an edited or removed entry back to its original content; restoring a call also restores its removed result.`,
 		"{foldRange: {from: entryId, to: entryId, note}}: replace a contiguous stretch of entries with one note you write; its first user or assistant message holds the note and the rest are removed. A range that would split a call from its result is refused.",
 		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what the outline showed, which of its entries are removed, and how to restore it.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
@@ -591,16 +600,10 @@ const editContextTool = defineTool({
 			breakdown = operationBreakdown(sessionManager, queued, base, operations);
 		}
 
+		if (edits.length === 0) throw new Error("Nothing to apply: these operations leave the context as it is, for example restoring entries that are not edited");
 		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const restores = parameters.apply === undefined && !parameters.dryRun && (parameters.operations as Operation[]).some((operation) => "restore" in operation);
-		const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits);
-		if (restores && reprocessed > RESTORE_CONFIRM_TOKENS) {
-			throw new Error(
-				`Not applied: this restore makes ~${formatTokens(reprocessed)} est. tokens lose the prompt cache, from entry ${earliest + 1} of ${entries}. Dry-run it, then apply the plan if it is worth it.`,
-			);
-		}
 		const report = effectReport(base, edited, edits) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {
