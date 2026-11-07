@@ -12,11 +12,11 @@ function runAgent(script, prompt, extraEnvironment = {}) {
 	const directory = mkdtempSync(join(tmpdir(), "self-edit-"));
 	const log = join(directory, "contexts.jsonl");
 	execFileSync(
-		"pi",
+		join(root, "node_modules/.bin/pi"),
 		["-p", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
 			"-e", join(root, "index.ts"), "-e", join(root, "test/fixtures/scripted-model.ts"),
 			"--model", "scripted/agent", "--session-dir", directory, prompt],
-		{ cwd: directory, env: { ...process.env, SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log, ...extraEnvironment }, stdio: "pipe" },
+		{ cwd: directory, env: { PATH: process.env.PATH, HOME: directory, PI_CODING_AGENT_DIR: join(directory, "agent"), SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log, ...extraEnvironment }, stdio: "pipe", timeout: 60_000 },
 	);
 	const sessionFile = readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl");
 	const contexts = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
