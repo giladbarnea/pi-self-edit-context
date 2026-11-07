@@ -1,6 +1,31 @@
+---
+last_updated: 2026-11-06T23-36
+---
 # pi-self-edit-context
 
-Lets a Pi agent edit its own context window mid-run.
+Lets a Pi agent edit its own context window mid-run, without deleting its session history.
+
+## Install
+
+Requires Node.js 22.19.0 or newer and Pi. The maintained Pi lines are 1.4.x and 1.5.x.
+
+From a checkout:
+
+```sh
+pi install .
+```
+
+Restart Pi or run `/reload`. To try it for one session without installing:
+
+```sh
+pi -e ./index.ts
+```
+
+Ask the agent to inspect its context with `context_outline`, then use `edit_context` to replace, fold or restore entries.
+These are agent tools, not slash commands. No API key or additional model is needed by the extension itself.
+
+Edits change future model requests, not the stored originals. This is not a way to erase secrets from session files.
+An edit can remove useful context and invalidate the prompt cache from the earliest change onward. Use a dry run to inspect that cost first.
 
 ## `context_outline`
 
@@ -30,6 +55,20 @@ When edits apply, earlier `context_outline` results after the batch's earliest c
 
 Edits are queued and returned from Pi's `turn_end` boundary as native `context_edit` entries. Pi validates and appends them, then rebuilds the running agent's context, so they apply from the next request in the same run and survive resume. The session file keeps every original message.
 
-Test: `npm test` runs real `pi -p` sessions against a scripted stand-in model; no model calls.
+## Development and CI
+
+```sh
+npm ci
+npm test
+npm pack --dry-run
+```
+
+`npm test` uses the locally installed Pi CLI and real `pi -p` sessions against a scripted stand-in model. No external model calls occur.
+Each session gets an isolated home and agent directory, with no inherited credentials or extension configuration.
+The locked development version is Pi 1.5.0. CI also installs exact Pi 1.4.0 packages and checks the installed versions before testing.
+
+The CI workflow runs on pull requests, pushes to `main` and manual dispatch. It uses Node.js 22.19.0 and read-only repository permissions.
+The suite checks next-request edits, dry runs, saved plans, stable block IDs, call/result pairing, refusals, restores and outline folding.
+It also previews the package contents. CI does not publish packages or make model requests.
 
 `test/monkey.test.mjs` drives a seeded random agent through ~40 batches of folds, ranges, restores, thinking drops and block edits, valid or not, often using IDs remembered from older outlines, then restores everything. It checks that every request stays sendable, refusals and dry runs persist nothing, folds remove the result of the call their ID originally named, outline counts agree with the removed list, and full restore brings every message back byte for byte. `MONKEY_SEEDS=1,2,…` and `MONKEY_ACTS=n` widen the search.

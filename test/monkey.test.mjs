@@ -14,11 +14,11 @@ function runMonkey(seed) {
 	const directory = mkdtempSync(join(tmpdir(), "self-edit-monkey-"));
 	const log = join(directory, "contexts.jsonl");
 	const run = spawnSync(
-		"pi",
+		join(root, "node_modules/.bin/pi"),
 		["-p", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
 			"-e", join(root, "index.ts"), "-e", join(root, "test/fixtures/scripted-model.ts"),
 			"--model", "scripted/agent", "--session-dir", directory, "ORIGINAL-REQUEST: monkey"],
-		{ cwd: directory, encoding: "utf8", env: { ...process.env, SCRIPTED_MODEL_SCRIPT: "monkey", SCRIPTED_MODEL_LOG: log, SCRIPTED_MODEL_SEED: String(seed), SCRIPTED_MODEL_ACTS: String(ACTS) } },
+		{ cwd: directory, encoding: "utf8", env: { PATH: process.env.PATH, HOME: directory, PI_CODING_AGENT_DIR: join(directory, "agent"), SCRIPTED_MODEL_SCRIPT: "monkey", SCRIPTED_MODEL_LOG: log, SCRIPTED_MODEL_SEED: String(seed), SCRIPTED_MODEL_ACTS: String(ACTS) }, timeout: 60_000 },
 	);
 	const sessionFile = readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl");
 	const contexts = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));

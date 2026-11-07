@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        pi: ["1.4.0", "1.5.0"]
+    env:
+      PI_VERSION: ${{ matrix.pi }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.19.0"
+      - name: Install test dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          if [ "$PI_VERSION" != "1.5.0" ]; then
+            npm install --no-save --package-lock=false --no-audit --no-fund "@earendil-works/pi-ai@$PI_VERSION" "@earendil-works/pi-coding-agent@$PI_VERSION"
+          fi
+      - name: Verify versions and behavior without user configuration
+        run: |
+          node --version
+          npm --version
+          test "$(node -p 'require("./node_modules/@earendil-works/pi-coding-agent/package.json").version')" = "$PI_VERSION"
+          test "$(node -p 'require("./node_modules/@earendil-works/pi-ai/package.json").version')" = "$PI_VERSION"
+          scratch="$(mktemp -d "${TMPDIR:-/tmp}/self-edit-ci.XXXXXX")"
+          mkdir -p "$scratch/home" "$scratch/agent" "$scratch/tmp"
+          env -i PATH="$PATH" HOME="$scratch/home" PI_CODING_AGENT_DIR="$scratch/agent" TMPDIR="$scratch/tmp" npm test
+      - name: Check package contents
+        run: npm pack --dry-run
