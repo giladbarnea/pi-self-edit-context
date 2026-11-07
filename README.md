@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-11-06T23-36
+last_updated: 2026-11-07T08-27
 ---
 # pi-self-edit-context
 
@@ -9,7 +9,13 @@ Lets a Pi agent edit its own context window mid-run, without deleting its sessio
 
 Requires Node.js 22.19.0 or newer and Pi. The maintained Pi lines are 1.4.x and 1.5.x.
 
-From a checkout:
+Install from [GitHub](https://github.com/giladbarnea/pi-self-edit-context):
+
+```sh
+pi install git:github.com/giladbarnea/pi-self-edit-context
+```
+
+Or, from a checkout:
 
 ```sh
 pi install .
