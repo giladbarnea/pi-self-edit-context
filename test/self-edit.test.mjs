@@ -4,23 +4,27 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { GPT_MODEL, GPT_THINKING_BLOCKS, writeCrossModelSession } from "./fixtures/cross-model-session.mjs";
 
 const root = new URL("..", import.meta.url).pathname;
 
-/** Run a real `pi -p` whose model is a scripted stand-in; return each context the model recorded and the session file. */
-function runAgent(script, prompt, extraEnvironment = {}) {
+/**
+ * Run a real `pi -p` whose model is a scripted stand-in; return each context the model recorded and the session file.
+ * `model` is "provider/id"; `session` is an existing session file to open instead of starting a new one.
+ */
+function runAgent(script, prompt, extraEnvironment = {}, { model = "scripted/agent", session } = {}) {
 	const directory = mkdtempSync(join(tmpdir(), "self-edit-"));
 	const log = join(directory, "contexts.jsonl");
 	execFileSync(
 		join(root, "node_modules/.bin/pi"),
 		["-p", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
 			"-e", join(root, "index.ts"), "-e", join(root, "test/fixtures/scripted-model.ts"),
-			"--model", "scripted/agent", "--session-dir", directory, prompt],
+			"--model", model, "--session-dir", directory, ...(session ? ["--session", session] : []), prompt],
 		{ cwd: directory, env: { PATH: process.env.PATH, HOME: directory, PI_CODING_AGENT_DIR: join(directory, "agent"), SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log, ...extraEnvironment }, stdio: "pipe", timeout: 60_000 },
 	);
-	const sessionFile = readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl");
+	const sessionFile = session ?? join(directory, readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl"));
 	const contexts = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-	const entries = readFileSync(join(directory, sessionFile), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	const entries = readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 	return { contexts, contextAfterEdit: contexts.at(-1), entries };
 }
 
@@ -286,6 +290,50 @@ test("a re-folded outline's note still says which of its entries are removed, no
 		assert.match(note, new RegExp(`When folded, 1 of the entries it lists were removed \\(~\\d+ est\\.\\): ${resultB.id}\\.`), `${label}: the note should name B's result as the one removed entry it lists: ${note}`);
 	}
 	assert.ok(contexts[1].some((message) => message.role === "toolResult" && message.toolCallId === secondOutline.message.content[0].id), "the note's restore should have brought the outline back");
+});
+
+/** Open the synthetic GPT→Claude session as `model`; return the outline the agent read, the dropThinking dry run and the stored entries. */
+function estimatesOnCrossModelSession({ signatures, model, identity }) {
+	const session = join(mkdtempSync(join(tmpdir(), "self-edit-session-")), "cross-model.jsonl");
+	const signatureCharacters = writeCrossModelSession(session, { signatures });
+	const environment = identity ? { SCRIPTED_MODEL_IDENTITY: identity } : {};
+	const { contextAfterEdit, entries } = runAgent("cross-model-estimates", "outline", environment, { model, session });
+	const [outline, dryRun] = contextAfterEdit.filter((message) => message.role === "toolResult").slice(-2).map(textOf);
+	const estimate = Number(outline.match(/^\d+ entries shown \(~([\d.]+)k est\.\)/)[1]) * 1000;
+	const meter = Number(outline.match(/Context: ([\d.]+)k tokens by Pi's usage meter/)[1]) * 1000;
+	const thinkingLine = (entry) => outline.split("\n").find((line) => line.startsWith(`  - ${entry.id}.t0 thinking,`));
+	// The session's GPT entries come first; the agent's own outline-call entry, with its signed thinking, follows them.
+	const assistants = messageEntries(entries, "assistant");
+	const gptThinkingLines = assistants.slice(0, GPT_THINKING_BLOCKS).map(thinkingLine);
+	assert.equal(gptThinkingLines.filter(Boolean).length, GPT_THINKING_BLOCKS, `every GPT thinking block should have a line:\n${outline}`);
+	const ownThinkingLine = thinkingLine(assistants[GPT_THINKING_BLOCKS]);
+	return { outline, dryRun, estimate, meter, signatureCharacters, gptThinkingLines, ownThinkingLine };
+}
+
+test("estimates count only what Pi sends: thinking another model wrote costs nothing on the current model", () => {
+	// The agent runs as scripted/agent, a different model from the gpt-6-astra that wrote the session's 20 signed thinking
+	// blocks (~43k characters ÷ 4 of signatures). Pi's transformMessages drops those blocks, so the original session and a
+	// copy with the signatures emptied must estimate the same, and near what Pi's meter reports for the request.
+	const original = estimatesOnCrossModelSession({ signatures: true, model: "scripted/agent" });
+	const stripped = estimatesOnCrossModelSession({ signatures: false, model: "scripted/agent" });
+	const signatureTokens = original.signatureCharacters / 4;
+	assert.ok(signatureTokens > 40_000, `the fixture should carry about 43k signature tokens, not ${signatureTokens}`);
+	assert.equal(original.estimate, stripped.estimate, `the header estimate should not count dropped signatures: original ~${original.estimate}, stripped ~${stripped.estimate}`);
+	assert.ok(Math.abs(original.estimate - original.meter) < original.meter, `the estimate should be near Pi's meter, not ${original.estimate} against ${original.meter}`);
+	for (const line of original.gptThinkingLines) assert.match(line, /thinking, ~0 est\., signed$/, `a dropped signed block should cost nothing: ${line}`);
+	assert.match(original.ownThinkingLine, /~1\.0k est\., signed$/, `the agent's own signed thinking is sent and should still count: ${original.ownThinkingLine}`);
+	assert.match(original.dryRun, /dropThinking before \w+ ~0;/, `dropping thinking Pi never sends should free nothing: ${original.dryRun}`);
+});
+
+test("estimates count signatures the current model does receive: the same model that wrote them", () => {
+	const identity = `${GPT_MODEL.provider}/${GPT_MODEL.api}/${GPT_MODEL.model}`;
+	const model = `${GPT_MODEL.provider}/${GPT_MODEL.model}`;
+	const original = estimatesOnCrossModelSession({ signatures: true, model, identity });
+	const stripped = estimatesOnCrossModelSession({ signatures: false, model, identity });
+	const signatureTokens = original.signatureCharacters / 4;
+	assert.ok(Math.abs(original.estimate - stripped.estimate - signatureTokens) < 200, `on the writing model the signatures are sent and should count: original ~${original.estimate}, stripped ~${stripped.estimate}, signatures ${signatureTokens}`);
+	for (const line of original.gptThinkingLines) assert.match(line, /thinking, ~2\.\dk est\., signed$/, `a sent signed block should cost its characters: ${line}`);
+	assert.match(original.dryRun, /dropThinking before \w+ ~4\d\.\dk;/, `dropping thinking the model receives should free its signatures: ${original.dryRun}`);
 });
 
 test("a restore that breaks the cache far back applies directly, and its report gives the cost", () => {

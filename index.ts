@@ -1,4 +1,5 @@
-import { Type } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Model, Type } from "@earendil-works/pi-ai";
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	defineTool,
 	estimateTokens,
@@ -14,6 +15,8 @@ import {
 type ContextEdit = { targetId: string; replacement: ContextEditEntry["replacement"] };
 type ProjectedEntry = SessionProjection["entries"][number];
 type Block = any;
+/** The session's current model, which decides what Pi sends; undefined when none is selected. */
+type CurrentModel = Model<string> | undefined;
 type Operation =
 	| { id: string; replacement: string | null }
 	| { fold: string; note: string }
@@ -65,10 +68,24 @@ function blockTokens(block: Block): number {
 	return Math.ceil((block.text?.length ?? 0) / 4);
 }
 
+/**
+ * Estimated tokens of one block of an assistant message as Pi sends it to the current model: Pi's own transform drops
+ * thinking another model wrote, with its signature, and whole failed or aborted messages, so those cost nothing.
+ */
+function sentBlockTokens(message: AssistantMessage, block: Block, model: CurrentModel): number {
+	if (!model) return blockTokens(block);
+	const sent = transformMessages([{ ...message, content: [block] }], model).some((candidate) => candidate.role === "assistant" && candidate.content.length > 0);
+	return sent ? blockTokens(block) : 0;
+}
+
+function sentContentTokens(message: AssistantMessage, blocks: Block[], model: CurrentModel): number {
+	return blocks.reduce((total, block) => total + sentBlockTokens(message, block, model), 0);
+}
+
 /** Assistant entries are the sum of their blocks, so an entry's size always equals its lines in the outline. */
-function entryTokens({ messages }: ProjectedEntry): number {
+function entryTokens({ messages }: ProjectedEntry, model: CurrentModel): number {
 	return messages.reduce((total, message) => {
-		if (message.role === "assistant") return total + message.content.reduce((sum: number, block: Block) => sum + blockTokens(block), 0);
+		if (message.role === "assistant") return total + sentContentTokens(message, message.content, model);
 		return total + estimateTokens(message);
 	}, 0);
 }
@@ -77,8 +94,8 @@ function visibleEntries(projection: SessionProjection): ProjectedEntry[] {
 	return projection.entries.filter(({ messages }) => messages.length > 0);
 }
 
-function totalTokens(projection: SessionProjection): number {
-	return visibleEntries(projection).reduce((total, entry) => total + entryTokens(entry), 0);
+function totalTokens(projection: SessionProjection, model: CurrentModel): number {
+	return visibleEntries(projection).reduce((total, entry) => total + entryTokens(entry, model), 0);
 }
 
 /** Number each kind within an entry: t for thinking, x for text, c for calls. @example positionalBlockIds("e1", [{ type: "thinking" }, { type: "toolCall" }, { type: "toolCall" }]) === ["e1.t0", "e1.c0", "e1.c1"] */
@@ -136,9 +153,11 @@ function removedEntries(projection: SessionProjection): ProjectedEntry[] {
 	return projection.entries.filter(({ sourceEntry, messages }) => messages.length === 0 && latestEdit.get(sourceEntry.id)?.replacement === null);
 }
 
-/** @example contentTokens("abcdefgh") === 2 */
-function contentTokens(content: unknown): number {
-	return asBlocks(content).reduce((total, block) => total + blockTokens(block), 0);
+/** Estimated tokens of an entry's stored content, as Pi would send it to the current model. */
+function storedTokens(entry: SessionEntry, model: CurrentModel): number {
+	const blocks = asBlocks(originalContent(entry));
+	if (entry.type === "message" && entry.message.role === "assistant") return sentContentTokens(entry.message, blocks, model);
+	return blocks.reduce((total, block) => total + blockTokens(block), 0);
 }
 
 /** Pair each tool result with its call the way Pi replays them: the earliest unanswered call with that ID. */
@@ -164,8 +183,8 @@ function labelled(head: string, text: string): string {
 	return preview ? `${head}: ${preview}` : head;
 }
 
-function entryHead(entry: ProjectedEntry, label: string): string {
-	const parts = [`${entry.sourceEntry.id} ${label}`, entry.sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(entryTokens(entry))} est.`];
+function entryHead(entry: ProjectedEntry, label: string, model: CurrentModel): string {
+	const parts = [`${entry.sourceEntry.id} ${label}`, entry.sourceEntry.timestamp.slice(5, 16).replace("T", " "), `~${formatTokens(entryTokens(entry, model))} est.`];
 	if (!isEditable(entry.sourceEntry)) parts.push("not editable");
 	if (isEditable(entry.sourceEntry) && isEdited(entry)) parts.push("edited");
 	return parts.join(", ");
@@ -184,28 +203,29 @@ const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use
 type OutlineUnit = { entry: ProjectedEntry; lines: string[]; entries: number; tokens: number; thinkingTokens: number; anchor: boolean };
 
 /** One entry as bullets: an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
-function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>): OutlineUnit {
+function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel): OutlineUnit {
 	const message = entry.messages.at(-1)!;
 	if (message.role !== "assistant") {
 		const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
-		const line = `- ${labelled(entryHead(entry, label), textOf(message.content))}`;
-		return { entry, lines: [line], entries: 1, tokens: entryTokens(entry), thinkingTokens: 0, anchor: message.role === "user" };
+		const line = `- ${labelled(entryHead(entry, label, model), textOf(message.content))}`;
+		return { entry, lines: [line], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: message.role === "user" };
 	}
-	const unit: OutlineUnit = { entry, lines: [`- ${entryHead(entry, "assistant")}`], entries: 1, tokens: entryTokens(entry), thinkingTokens: 0, anchor: false };
+	const unit: OutlineUnit = { entry, lines: [`- ${entryHead(entry, "assistant", model)}`], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: false };
 	const ids = blockIdsOf(entry);
 	message.content.forEach((block: Block, index: number) => {
 		const kind = block.type === "toolCall" ? "call" : ids[index].includes(".n") ? "note" : block.type;
-		const head = `${ids[index]} ${kind}, ~${formatTokens(blockTokens(block))} est.`;
+		const tokens = sentBlockTokens(message, block, model);
+		const head = `${ids[index]} ${kind}, ~${formatTokens(tokens)} est.`;
 		if (block.type === "thinking") {
-			unit.thinkingTokens += blockTokens(block);
+			unit.thinkingTokens += tokens;
 			unit.lines.push(`  - ${head}${block.thinkingSignature ? ", signed" : ""}`);
 		} else if (block.type === "toolCall") unit.lines.push(`  - ${labelled(head, `${block.name}(${JSON.stringify(block.arguments)})`)}`);
 		else unit.lines.push(`  - ${labelled(head, block.text ?? "")}`);
 		const result = block.type === "toolCall" ? resultByCall.get(block) : undefined;
 		if (!result) return;
-		unit.lines.push(`    - ${labelled(entryHead(result, "result"), textOf(result.messages.at(-1)!.content))}`);
+		unit.lines.push(`    - ${labelled(entryHead(result, "result", model), textOf(result.messages.at(-1)!.content))}`);
 		unit.entries += 1;
-		unit.tokens += entryTokens(result);
+		unit.tokens += entryTokens(result, model);
 	});
 	return unit;
 }
@@ -220,14 +240,14 @@ function collapsedLine(units: OutlineUnit[]): string {
 }
 
 /** Entries of at least minTokens, and user messages, in full; each run of smaller entries as one line with its bounds and size. */
-function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number): string {
+function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
 	const removed = removedEntries(projection).length;
 	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
 	const collapseNote = minTokens > 0 ? ` Entries under ${formatTokens(minTokens)} est. are collapsed into runs with their bounds; {"minTokens": 0} shows every entry.` : "";
-	const lines = [`${visible.length} entries shown (~${formatTokens(totalTokens(projection))} est.)${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`];
+	const lines = [`${visible.length} entries shown (~${formatTokens(totalTokens(projection, model))} est.)${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`];
 	let run: OutlineUnit[] = [];
 	const flush = (): void => {
 		if (run.length > 0) lines.push(collapsedLine(run));
@@ -235,7 +255,7 @@ function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens
 	};
 	for (const entry of visible) {
 		if (nestedResults.has(entry)) continue;
-		const unit = outlineUnit(entry, resultByCall);
+		const unit = outlineUnit(entry, resultByCall, model);
 		if (unit.anchor || unit.tokens >= minTokens) {
 			flush();
 			lines.push(...unit.lines);
@@ -246,14 +266,13 @@ function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens
 }
 
 /** The entries edits removed from context, with their original size and first line, for restore. */
-function removedOutlineOf(projection: SessionProjection): string {
+function removedOutlineOf(projection: SessionProjection, model: CurrentModel): string {
 	const removed = removedEntries(projection);
 	if (removed.length === 0) return "No entries are removed by edits.";
 	const lines = removed.map(({ sourceEntry }) => {
-		const content = originalContent(sourceEntry);
 		const role = sourceEntry.type === "message" ? sourceEntry.message.role : "custom";
-		const head = `${sourceEntry.id} ${role}, ${sourceEntry.timestamp.slice(5, 16).replace("T", " ")}, ~${formatTokens(contentTokens(content))} est.`;
-		return `- ${labelled(head, textOf(content))}`;
+		const head = `${sourceEntry.id} ${role}, ${sourceEntry.timestamp.slice(5, 16).replace("T", " ")}, ~${formatTokens(storedTokens(sourceEntry, model))} est.`;
+		return `- ${labelled(head, textOf(originalContent(sourceEntry)))}`;
 	});
 	return [`${removed.length} entr${removed.length === 1 ? "y" : "ies"} removed by edits; {"restore": id} brings one back:`, ...lines].join("\n");
 }
@@ -455,11 +474,11 @@ function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outl
 }
 
 /** The note a folded outline leaves: what it showed, which of its entries are removed, and how to get it back. */
-function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall): string {
+function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall, model: CurrentModel): string {
 	const taken = outline.result.sourceEntry.timestamp.slice(11, 16);
 	const summary = outlineSummary(textOf(outline.result.messages.at(-1)!.content));
 	const removed = removedSinceOutline(base, batch, outline);
-	const size = formatTokens(removed.reduce((total, entry) => total + contentTokens(originalContent(entry)), 0));
+	const size = formatTokens(removed.reduce((total, entry) => total + storedTokens(entry, model), 0));
 	const which = removed.length === 1 ? removed[0].id : `the earliest ${removed[0]?.id}, the latest ${removed.at(-1)?.id}`;
 	const removedPart = removed.length === 0 ? "none of the entries it lists were removed" : `${removed.length} of the entries it lists were removed (~${size} est.): ${which}`;
 	const folded = new Date().toISOString().slice(11, 16);
@@ -470,7 +489,7 @@ function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outlin
  * Fold the earlier outlines that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
  * Outlines before the earliest change are left, since folding them would move the cache break earlier.
  */
-function withOutlineFolds(base: SessionProjection, operations: Operation[], edits: ContextEdit[]): { edits: ContextEdit[]; note: string } {
+function withOutlineFolds(base: SessionProjection, operations: Operation[], edits: ContextEdit[], model: CurrentModel): { edits: ContextEdit[]; note: string } {
 	if (edits.length === 0) return { edits, note: "" };
 	const earliest = earliestChange(base, edits);
 	const targeted = new Set(edits.map(({ targetId }) => targetId));
@@ -480,29 +499,29 @@ function withOutlineFolds(base: SessionProjection, operations: Operation[], edit
 	const left = calls.filter((call) => call.position <= earliest);
 	const leftNote = left.length === 0
 		? ""
-		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
+		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result, model))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
 	if (folded.length === 0) return { edits, note: leftNote };
-	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, edits, call) }));
+	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, edits, call, model) }));
 	const foldedNote = ` Also folds ${folded.length} earlier outline${folded.length === 1 ? "" : "s"} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
 	return { edits: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
 }
 
 /** Where the edits break the prompt cache, and how many estimated tokens from there on are reprocessed once. */
-function cacheBreak(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): { earliest: number; entries: number; reprocessed: number } {
+function cacheBreak(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[], model: CurrentModel): { earliest: number; entries: number; reprocessed: number } {
 	const visible = visibleEntries(base);
 	const earliest = earliestChange(base, edits);
 	const positionById = new Map(visible.map((entry, index) => [entry.sourceEntry.id, index]));
 	const reprocessed = visibleEntries(edited)
 		.filter((entry) => (positionById.get(entry.sourceEntry.id) ?? Infinity) >= earliest)
-		.reduce((total, entry) => total + entryTokens(entry), 0);
+		.reduce((total, entry) => total + entryTokens(entry, model), 0);
 	return { earliest, entries: visible.length, reprocessed };
 }
 
 /** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
-function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[]): string {
-	const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits);
-	const before = totalTokens(base);
-	const after = totalTokens(edited);
+function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[], model: CurrentModel): string {
+	const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits, model);
+	const before = totalTokens(base, model);
+	const after = totalTokens(edited, model);
 	return [
 		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} est. tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
 		`Earliest change: ${visibleEntries(base)[earliest].sourceEntry.id}, entry ${earliest + 1} of ${entries}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
@@ -520,12 +539,12 @@ function operationLabel(operation: Operation): string {
 }
 
 /** Tokens each operation frees when applied alone, so the agent can judge which ones are worth their cache cost. */
-function operationBreakdown(sessionManager: ReadonlySessionManager, queued: ContextEdit[], base: SessionProjection, operations: Operation[]): string {
+function operationBreakdown(sessionManager: ReadonlySessionManager, queued: ContextEdit[], base: SessionProjection, operations: Operation[], model: CurrentModel): string {
 	if (operations.length < 2) return "";
-	const before = totalTokens(base);
+	const before = totalTokens(base, model);
 	const parts = operations.map((operation) => {
 		const alone = projectWithEdits(sessionManager, [...queued, ...compileOperations(base, [operation])]);
-		return `${operationLabel(operation)} ~${formatTokens(before - totalTokens(alone))}`;
+		return `${operationLabel(operation)} ~${formatTokens(before - totalTokens(alone, model))}`;
 	});
 	return ` Per operation, each measured alone: ${parts.join("; ")}.`;
 }
@@ -545,7 +564,7 @@ const contextOutlineTool = defineTool({
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
 		const projection = ctx.sessionManager.buildSessionProjection();
-		const text = parameters.removed ? removedOutlineOf(projection) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS);
+		const text = parameters.removed ? removedOutlineOf(projection, ctx.model) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS, ctx.model);
 		return { content: [{ type: "text" as const, text }] };
 	},
 });
@@ -597,15 +616,15 @@ const editContextTool = defineTool({
 		} else {
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
 			const operations = parameters.operations as Operation[];
-			({ edits, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations)));
-			breakdown = operationBreakdown(sessionManager, queued, base, operations);
+			({ edits, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model));
+			breakdown = operationBreakdown(sessionManager, queued, base, operations, ctx.model);
 		}
 
 		if (edits.length === 0) throw new Error("Nothing to apply: these operations leave the context as it is, for example restoring entries that are not edited");
 		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const report = effectReport(base, edited, edits) + outlineNote + breakdown;
+		const report = effectReport(base, edited, edits, ctx.model) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;

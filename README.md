@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-11-07T08-27
+last_updated: 2026-11-09T14-10
 ---
 # pi-self-edit-context
 
@@ -35,7 +35,7 @@ An edit can remove useful context and invalidate the prompt cache from the earli
 
 ## `context_outline`
 
-Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. By default, user messages and entries of 2k+ est. tokens are shown in full; each run of smaller entries is one line with its bounds, size and thinking, so the small tail stays visible as a cost. `{minTokens: 0}` shows every entry. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. An entry's size is the sum of its blocks, signatures included, so the header total equals the sum of the lines.
+Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. By default, user messages and entries of 2k+ est. tokens are shown in full; each run of smaller entries is one line with its bounds, size and thinking, so the small tail stays visible as a cost. `{minTokens: 0}` shows every entry. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. Sizes count what Pi sends to the session's current model, through Pi's own message transform: a thinking block that another model wrote is dropped before sending, signature included, so it costs 0; a block the current model wrote counts its thinking and signature. An entry's size is the sum of its blocks, so the header total equals the sum of the lines.
 
 ## `edit_context`
 
@@ -75,6 +75,7 @@ The locked development version is Pi 1.5.0. CI also installs exact Pi 1.4.0 pack
 
 The CI workflow runs on pull requests, pushes to `main` and manual dispatch. It uses Node.js 22.19.0 and read-only repository permissions.
 The suite checks next-request edits, dry runs, saved plans, stable block IDs, call/result pairing, refusals, restores and outline folding.
+It also opens a synthetic session that switched from GPT to another model and checks that the estimates ignore the GPT signatures Pi drops, while the same model posing as GPT still counts them.
 It also previews the package contents. CI does not publish packages or make model requests.
 
 `test/monkey.test.mjs` drives a seeded random agent through ~40 batches of folds, ranges, restores, thinking drops and block edits, valid or not, often using IDs remembered from older outlines, then restores everything. It checks that every request stays sendable, refusals and dry runs persist nothing, folds remove the result of the call their ID originally named, outline counts agree with the removed list, and full restore brings every message back byte for byte. `MONKEY_SEEDS=1,2,…` and `MONKEY_ACTS=n` widen the search.

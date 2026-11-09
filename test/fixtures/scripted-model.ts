@@ -425,6 +425,17 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	"cross-model-estimates": [
+		() => fauxAssistantMessage([signedThinking("THINK-OWN"), fauxToolCall("context_outline", { minTokens: 0 })]),
+		(messages) => {
+			const outlineText = lastToolResultText(messages);
+			const latest = assistantEntryIds(outlineText).at(-1)!;
+			// A second operation makes the dry run report what dropThinking frees on its own.
+			const firstUser = outlineId(outlineText, "user", "Question 1:");
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ dropThinking: { before: latest } }, { id: firstUser, replacement: "Q1" }], dryRun: true }));
+		},
+		record,
+	],
 };
 
 /** The faux provider estimates usage from characters; a script can instead report a fixed provider count, as a real provider would. */
@@ -445,7 +456,9 @@ export default function (pi: ExtensionAPI): void {
 			return { message: { ...event.message, usage: { ...usage, totalTokens: usage.cacheRead + usage.output } } };
 		});
 	}
-	const faux = fauxProvider({ provider: "scripted", models: [{ id: "agent", contextWindow: 1_000_000 }] });
+	// A script can pose as another provider's model, "provider/api/id", to be the same model as stored assistant messages.
+	const [provider, api, modelId] = (process.env.SCRIPTED_MODEL_IDENTITY ?? "scripted/scripted/agent").split("/");
+	const faux = fauxProvider({ provider, api, models: [{ id: modelId, contextWindow: 1_000_000 }] });
 	faux.setResponses(scripts[scriptName].map((step) => (context: any) => step(context.messages)));
 	pi.registerProvider(faux.provider);
 }
