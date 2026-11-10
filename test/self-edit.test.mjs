@@ -89,6 +89,29 @@ test("a dry run reports the effect without changing the context", () => {
 	assert.match(textOf(contextAfterEdit.find((message) => message.role === "user")), /ORIGINAL-REQUEST/);
 });
 
+test("dry-run and apply results report Pi's usage meter, so the agent need not outline again to read it", () => {
+	// The provider reports 400k prompt tokens while the messages are a few hundred characters, so only the meter says ~400k.
+	const { contexts, contextAfterEdit } = runAgent("dry-run-then-apply", "ORIGINAL-REQUEST: anything", { SCRIPTED_MODEL_PROMPT_TOKENS: "400000" });
+	const dryRun = textOf(contexts[0].findLast((message) => message.role === "toolResult"));
+	assert.match(dryRun, /^Dry run, nothing applied\. Context now: 40\d\.\dk tokens by Pi's usage meter\. \d+ entr/, `dry run: ${dryRun}`);
+	const applied = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));
+	assert.match(applied, /^Applied from your next request\. Context before this edit: 40\d\.\dk tokens by Pi's usage meter; the meter updates after your next response\. \d+ entr/, `apply: ${applied}`);
+});
+
+test("both tool descriptions recommend planning the whole reduction, then applying it in one edit_context call", () => {
+	// The descriptions as Pi sends them to the model.
+	const { contextAfterEdit: tools } = runAgent("record-tool-descriptions", "anything");
+	const descriptionOf = (name) => tools.find((tool) => tool.name === name)?.description ?? `no ${name} tool reached the model: ${JSON.stringify(tools)}`;
+	const edit = descriptionOf("edit_context");
+	const outline = descriptionOf("context_outline");
+	assert.ok(edit.startsWith("Plan the whole reduction before you apply any of it, then apply it in one call."), `edit_context description: ${edit}`);
+	for (const phrase of ["once an edit applies you can no longer see the original", "never refer to a summary you have not written yet", "several small calls cost far more than one large call", "if you must edit in steps, outline again before the next step"]) {
+		assert.ok(edit.includes(phrase), `edit_context description lacks "${phrase}": ${edit}`);
+	}
+	assert.ok(!edit.includes("so batch edits into one call"), `the old cache-only wording should be replaced: ${edit}`);
+	assert.ok(outline.includes("Take one outline, plan the full set of edits from it, and apply them in a single edit_context call"), `context_outline description: ${outline}`);
+});
+
 test("a dry run of several operations reports what each frees on its own", () => {
 	const { contextAfterEdit, entries } = runAgent("dry-run-breakdown", "ORIGINAL-REQUEST: anything");
 	const report = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));

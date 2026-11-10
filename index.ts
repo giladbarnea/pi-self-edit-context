@@ -193,9 +193,14 @@ function entryHead(entry: ProjectedEntry, label: string, model: CurrentModel): s
 /** Pi's usage meter: the provider's count for the last response plus an estimate for what came after; null right after an edit until the next response. */
 type ContextUsage = { tokens: number | null } | undefined;
 
+/** @example meterReading({ tokens: 504480 }) === "504.5k tokens by Pi's usage meter" */
+function meterReading(usage: ContextUsage): string {
+	return usage?.tokens == null ? "unknown until the next response, by Pi's usage meter" : `${formatTokens(usage.tokens)} tokens by Pi's usage meter`;
+}
+
 /** @example meterLine({ tokens: 504480 }) === "Context: 504.5k tokens by Pi's usage meter." */
 function meterLine(usage: ContextUsage): string {
-	return usage?.tokens == null ? "Context: unknown until the next response, by Pi's usage meter." : `Context: ${formatTokens(usage.tokens)} tokens by Pi's usage meter.`;
+	return `Context: ${meterReading(usage)}.`;
 }
 
 const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use them to compare entries, not as real counts.";
@@ -557,6 +562,7 @@ const contextOutlineTool = defineTool({
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
 		`By default, user messages and entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are shown in full, and each run of smaller entries is one line with its bounds, size and thinking; set minTokens to change the threshold, 0 for every entry.`,
+		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines after its earliest change.",
 	].join(" "),
 	parameters: Type.Object({
 		removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })),
@@ -573,6 +579,7 @@ const editContextTool = defineTool({
 	name: "edit_context",
 	label: "Edit Context",
 	description: [
+		"Plan the whole reduction before you apply any of it, then apply it in one call. Read each entry before you replace it, not only its outline line, because once an edit applies you can no longer see the original. Write notes only about content that exists now; never refer to a summary you have not written yet.",
 		"Edit your own context window, using IDs from context_outline. Operations:",
 		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
@@ -582,7 +589,7 @@ const editContextTool = defineTool({
 		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what the outline showed, which of its entries are removed, and how to restore it.",
 		"Operations in one call apply in order, each to the result of the ones before it.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
-		"Everything after the earliest change is reprocessed without the prompt cache once, so batch edits into one call. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
+		"Everything after the earliest change is reprocessed without the prompt cache once. Each call whose earliest change is near the start rewrites almost the whole prompt cache, so several small calls cost far more than one large call. Applying also folds earlier outlines after the earliest change; if you must edit in steps, outline again before the next step. dryRun reports the tokens freed, the earliest changed entry and how many tokens from there on lose the prompt cache once, confirms every tool call still has its result, and with several operations gives the tokens each frees alone; it applies nothing and returns a plan ID, and {apply: planId} commits that exact plan without resending it. A refused edit changes nothing and says why.",
 	].join(" "),
 	parameters: Type.Object({
 		operations: Type.Optional(
@@ -629,11 +636,12 @@ const editContextTool = defineTool({
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;
 			plansById.set(planId, { sessionId, edits, breakdown, outlineNote });
-			return { content: [{ type: "text" as const, text: `Dry run, nothing applied. ${report} To apply exactly this, call edit_context with {"apply": "${planId}"}.` }] };
+			return { content: [{ type: "text" as const, text: `Dry run, nothing applied. Context now: ${meterReading(ctx.getContextUsage())}. ${report} To apply exactly this, call edit_context with {"apply": "${planId}"}.` }] };
 		}
 		pendingEditsBySession.set(sessionId, [...queued, ...edits]);
 		if (parameters.apply !== undefined) plansById.delete(parameters.apply);
-		return { content: [{ type: "text" as const, text: `Applied from your next request. ${report}` }] };
+		const meter = `Context before this edit: ${meterReading(ctx.getContextUsage())}; the meter updates after your next response.`;
+		return { content: [{ type: "text" as const, text: `Applied from your next request. ${meter} ${report}` }] };
 	},
 });
 

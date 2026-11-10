@@ -4,7 +4,7 @@ import { appendFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-type ScriptStep = (messages: any[]) => ReturnType<typeof fauxAssistantMessage>;
+type ScriptStep = (messages: any[], context: any) => ReturnType<typeof fauxAssistantMessage>;
 
 const logPath = process.env.SCRIPTED_MODEL_LOG!;
 const scriptName = process.env.SCRIPTED_MODEL_SCRIPT!;
@@ -425,6 +425,14 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	"record-tool-descriptions": [
+		(messages, context) => {
+			// Pi 1.4 passes tools beside the messages; Pi 1.5 declares them in system messages.
+			const tools = [...(context.tools ?? []), ...messages.flatMap((message) => (message.role === "system" ? (message.toolsAdded ?? []) : []))];
+			appendFileSync(logPath, JSON.stringify(tools.map(({ name, description }) => ({ name, description }))) + "\n");
+			return fauxAssistantMessage("done");
+		},
+	],
 	"cross-model-estimates": [
 		() => fauxAssistantMessage([signedThinking("THINK-OWN"), fauxToolCall("context_outline", { minTokens: 0 })]),
 		(messages) => {
@@ -459,6 +467,6 @@ export default function (pi: ExtensionAPI): void {
 	// A script can pose as another provider's model, "provider/api/id", to be the same model as stored assistant messages.
 	const [provider, api, modelId] = (process.env.SCRIPTED_MODEL_IDENTITY ?? "scripted/scripted/agent").split("/");
 	const faux = fauxProvider({ provider, api, models: [{ id: modelId, contextWindow: 1_000_000 }] });
-	faux.setResponses(scripts[scriptName].map((step) => (context: any) => step(context.messages)));
+	faux.setResponses(scripts[scriptName].map((step) => (context: any) => step(context.messages, context)));
 	pi.registerProvider(faux.provider);
 }
