@@ -254,6 +254,50 @@ test("the default outline collapses small entries into runs that keep their boun
 	assert.ok(lines.includes(`- … 5 entries ${firstRead.id} → ${outlineCall.id}, ~1.0k est., ~1.0k est. in thinking`), `run line missing or wrong:\n${outline}`);
 });
 
+test("from and to outline only that stretch, at the given minTokens, and the header still gives the whole context", () => {
+	// Reads A and B form the first collapsed run at minTokens 500; C (signed thinking, ~1.0k) and D come after it.
+	const { contexts, entries } = runAgent("outline-stretch", "ORIGINAL-REQUEST: anything");
+	const [readA, readB, readC, readD, collapsedCall] = messageEntries(entries, "assistant");
+	const [resultA, resultB] = messageEntries(entries, "toolResult");
+	const stretch = textOf(contexts[1].findLast((message) => message.role === "toolResult"));
+	const [header, ...lines] = stretch.split("\n");
+	// The whole context is what the full outline counted, plus its own result and the entry making the stretch call.
+	const inContext = Number(textOf(contexts[0].findLast((message) => message.role === "toolResult")).match(/^(\d+) entries shown/)[1]) + 2;
+	assert.match(header, new RegExp(`^4 entries shown \\(~\\d+ est\\.\\), from ${readA.id} to ${readB.id}, of ${inContext} in context \\(~[\\d.]+k? est\\.\\)\\. Context: .+ by Pi's usage meter\\.`), `header: ${header}`);
+	const expected = [
+		new RegExp(`^- ${readA.id} assistant, `),
+		new RegExp(`^  - ${readA.id}\\.c0 call, `),
+		new RegExp(`^    - ${resultA.id} result, `),
+		new RegExp(`^- ${readB.id} assistant, `),
+		new RegExp(`^  - ${readB.id}\\.c0 call, `),
+		new RegExp(`^    - ${resultB.id} result, `),
+	];
+	assert.equal(lines.length, expected.length, `only the stretch should be listed:\n${stretch}`);
+	expected.forEach((pattern, index) => assert.match(lines[index], pattern, `line ${index + 1}:\n${stretch}`));
+	for (const outside of [readC, readD, collapsedCall]) assert.ok(!stretch.includes(outside.id), `${outside.id} is outside the stretch:\n${stretch}`);
+});
+
+test("a stretch that ends before it starts, or is bounded by a block ID, is refused with the reason", () => {
+	const { contextAfterEdit, entries } = runAgent("outline-stretch-refusals", "ORIGINAL-REQUEST: anything");
+	const [readA, readB] = messageEntries(entries, "assistant");
+	const [reversed, blockBound] = contextAfterEdit.filter((message) => message.role === "toolResult").slice(-2);
+	assert.equal(reversed.isError, true, `a reversed stretch should be refused: ${textOf(reversed)}`);
+	assert.match(textOf(reversed), new RegExp(`The stretch ${readB.id} → ${readA.id} ends before it starts`), `reversed: ${textOf(reversed)}`);
+	assert.equal(blockBound.isError, true, `a block-ID bound should be refused: ${textOf(blockBound)}`);
+	assert.match(textOf(blockBound), new RegExp(`${readA.id}\\.c0 is not an entry line of your current outline; use an entry ID`), `block bound: ${textOf(blockBound)}`);
+});
+
+test("a folded stretch outline's note names its stretch and counts only removed entries inside it", () => {
+	// Folding D's read removes D's result, which the full outline lists and the A → B stretch does not.
+	const { contexts, entries } = runAgent("outline-stretch", "ORIGINAL-REQUEST: anything");
+	const [readA, readB, , readD, collapsedCall, stretchCall] = messageEntries(entries, "assistant");
+	const resultD = messageEntries(entries, "toolResult").find((entry) => entry.message.toolCallId === readD.message.content[0].id);
+	const noteFor = (call) => textOf(contexts[2].find((message) => message.role === "assistant" && textOf(message).includes(`{"restore": "${call.id}"}`)) ?? { content: [] });
+	const stretchNote = noteFor(stretchCall);
+	assert.match(stretchNote, new RegExp(`showed 4 entries \\(~\\d+ est\\.\\), from ${readA.id} to ${readB.id}\\. When folded, none of the entries it lists were removed\\.`), `stretch note: ${stretchNote}`);
+	assert.match(noteFor(collapsedCall), new RegExp(`When folded, 1 of the entries it lists were removed \\(~\\d+ est\\.\\): ${resultD.id}\\.`), `full outline note: ${noteFor(collapsedCall)}`);
+});
+
 test("a batch that restores an entry does not also auto-fold the outline calls in it", () => {
 	const { contextAfterEdit, entries } = runAgent("restore-and-auto-fold-same-entry", "ORIGINAL-REQUEST: anything");
 	const outlineEntry = messageEntries(entries, "assistant")[1];

@@ -206,6 +206,8 @@ function meterLine(usage: ContextUsage): string {
 const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use them to compare entries, not as real counts.";
 
 type OutlineUnit = { entry: ProjectedEntry; lines: string[]; entries: number; tokens: number; thinkingTokens: number; anchor: boolean };
+/** A stretch of the outline to show alone, from one entry ID to another, inclusive. */
+type Stretch = { from: string; to: string };
 
 /** One entry as bullets: an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
 function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel): OutlineUnit {
@@ -235,39 +237,63 @@ function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEn
 	return unit;
 }
 
+function totalsOf(units: OutlineUnit[]): { entries: number; tokens: number; thinking: number } {
+	return units.reduce((total, unit) => ({ entries: total.entries + unit.entries, tokens: total.tokens + unit.tokens, thinking: total.thinking + unit.thinkingTokens }), { entries: 0, tokens: 0, thinking: 0 });
+}
+
 /** @example collapsedLine([unit("a1", 2, 300, 0), unit("b2", 1, 200, 50)]) === "- … 3 entries a1 → b2, ~500 est., ~50 est. in thinking" */
 function collapsedLine(units: OutlineUnit[]): string {
-	const entries = units.reduce((total, unit) => total + unit.entries, 0);
-	const tokens = units.reduce((total, unit) => total + unit.tokens, 0);
-	const thinking = units.reduce((total, unit) => total + unit.thinkingTokens, 0);
+	const { entries, tokens, thinking } = totalsOf(units);
 	const bounds = units.length === 1 ? units[0].entry.sourceEntry.id : `${units[0].entry.sourceEntry.id} → ${units.at(-1)!.entry.sourceEntry.id}`;
 	return `- … ${entries} entr${entries === 1 ? "y" : "ies"} ${bounds}, ~${formatTokens(tokens)} est.${thinking > 0 ? `, ~${formatTokens(thinking)} est. in thinking` : ""}`;
 }
 
-/** Entries of at least minTokens, and user messages, in full; each run of smaller entries as one line with its bounds and size. */
-function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel): string {
+/** The units from the one whose entry is `from` to the one whose entry is `to`. Throws when a bound is not an entry line of the outline. */
+function stretchOf(units: OutlineUnit[], { from, to }: Stretch): OutlineUnit[] {
+	const indexOf = (id: string): number => {
+		const index = units.findIndex((unit) => unit.entry.sourceEntry.id === id);
+		if (index < 0) throw new Error(`${id} is not an entry line of your current outline; use an entry ID, such as a collapsed run's bounds, not a block ID or a result nested under its call`);
+		return index;
+	};
+	const start = indexOf(from);
+	const end = indexOf(to);
+	if (end < start) throw new Error(`The stretch ${from} → ${to} ends before it starts`);
+	return units.slice(start, end + 1);
+}
+
+/**
+ * Entries of at least minTokens, and user messages, in full; each run of smaller entries as one line with its bounds and size.
+ * With a stretch, only its entries are listed; the header still gives the whole context.
+ */
+function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel, stretch: Stretch | undefined): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
-	const removed = removedEntries(projection).length;
-	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
-	const collapseNote = minTokens > 0 ? ` Entries under ${formatTokens(minTokens)} est. are collapsed into runs with their bounds; {"minTokens": 0} shows every entry.` : "";
-	const lines = [`${visible.length} entries shown (~${formatTokens(totalTokens(projection, model))} est.)${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`];
+	const units = visible.filter((entry) => !nestedResults.has(entry)).map((entry) => outlineUnit(entry, resultByCall, model));
+	const shown = stretch ? stretchOf(units, stretch) : units;
+	const total = totalTokens(projection, model);
+	const body: string[] = [];
 	let run: OutlineUnit[] = [];
 	const flush = (): void => {
-		if (run.length > 0) lines.push(collapsedLine(run));
+		if (run.length > 0) body.push(collapsedLine(run));
 		run = [];
 	};
-	for (const entry of visible) {
-		if (nestedResults.has(entry)) continue;
-		const unit = outlineUnit(entry, resultByCall, model);
+	for (const unit of shown) {
 		if (unit.anchor || unit.tokens >= minTokens) {
 			flush();
-			lines.push(...unit.lines);
+			body.push(...unit.lines);
 		} else run.push(unit);
 	}
 	flush();
-	return lines.join("\n");
+	const removed = removedEntries(projection).length;
+	const removedNote = removed > 0 ? `, ${removed} removed by edits (list them with {"removed": true})` : "";
+	const scope = stretch
+		? `${totalsOf(shown).entries} entries shown (~${formatTokens(totalsOf(shown).tokens)} est.), from ${stretch.from} to ${stretch.to}, of ${visible.length} in context (~${formatTokens(total)} est.)`
+		: `${visible.length} entries shown (~${formatTokens(total)} est.)`;
+	const collapseNote = minTokens > 0
+		? ` Entries under ${formatTokens(minTokens)} est. are collapsed into runs with their bounds; {"minTokens": 0} shows every entry; add {"from": id, "to": id} to show only the entries from one ID to another, such as a run's bounds.`
+		: "";
+	return [`${scope}${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`, ...body].join("\n");
 }
 
 /** The entries edits removed from context, with their original size and first line, for restore. */
@@ -432,7 +458,7 @@ function earliestChange(base: SessionProjection, edits: ContextEdit[]): number {
 	return visibleEntries(base).findIndex((entry) => editedIds.has(entry.sourceEntry.id));
 }
 
-type OutlineCall = { entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number };
+type OutlineCall = { entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number; stretch: Stretch | undefined };
 
 /** Earlier context_outline calls with their results, excluding the agent's current message. */
 function outlineCalls(base: SessionProjection): OutlineCall[] {
@@ -444,25 +470,39 @@ function outlineCalls(base: SessionProjection): OutlineCall[] {
 		const ids = blockIdsOf(entry);
 		return (entry.messages.at(-1)!.content as Block[]).flatMap((block, index) => {
 			const result = block.type === "toolCall" && block.name === OUTLINE_TOOL ? resultByCall.get(block) : undefined;
-			return result ? [{ entry, blockId: ids[index], result, position }] : [];
+			const stretch = block.arguments?.from === undefined ? undefined : { from: block.arguments.from, to: block.arguments.to };
+			return result ? [{ entry, blockId: ids[index], result, position, stretch }] : [];
 		});
 	});
 }
 
-/** @example outlineSummary("12 entries shown (~3.1k est.), 2 removed by edits") === "showed 12 entries (~3.1k est.)" */
+/**
+ * @example outlineSummary("12 entries shown (~3.1k est.), 2 removed by edits") === "showed 12 entries (~3.1k est.)"
+ * @example outlineSummary("4 entries shown (~90 est.), from a1 to b2, of 12 in context (~3.1k est.)") === "showed 4 entries (~90 est.), from a1 to b2"
+ */
 function outlineSummary(text: string): string {
-	const shown = text.match(/^(\d+) entries shown \((~[^)]+)\)/);
-	if (shown) return `showed ${shown[1]} entries (${shown[2]})`;
+	const shown = text.match(/^(\d+) entries shown \((~[^)]+)\)(, from \S+ to \S+(?=, of ))?/);
+	if (shown) return `showed ${shown[1]} entries (${shown[2]})${shown[3] ?? ""}`;
 	const removed = text.match(/^(\d+) entr(?:y|ies) removed by edits/);
 	return removed ? `listed ${removed[1]} entries removed by edits` : "listed no removed entries";
 }
 
+/** IDs of the entries a stretch outline covers: those from `from` to `to`, and the results of the calls among them. */
+function stretchEntryIds(base: SessionProjection, { from, to }: Stretch): Set<string> {
+	const ids = base.entries.map(({ sourceEntry }) => sourceEntry.id);
+	const inside = base.entries.slice(ids.indexOf(from), ids.indexOf(to) + 1).map(({ sourceEntry }) => sourceEntry).filter(isEditable);
+	const callIds = new Set(inside.flatMap((entry) => asBlocks(originalContent(entry)).flatMap((block) => (block.type === "toolCall" ? [block.id] : []))));
+	const results = base.entries.map(({ sourceEntry }) => sourceEntry).filter((entry) => entry.type === "message" && entry.message.role === "toolResult" && callIds.has(entry.message.toolCallId));
+	return new Set([...inside, ...results].map((entry) => entry.id));
+}
+
 /**
  * Entries an outline listed that are removed once the batch applies: those whose latest removal came after the outline was taken.
- * Entries already removed when it was taken are not in it; other outlines' results have notes of their own.
+ * Entries already removed when it was taken are not in it; other outlines' results have notes of their own. A stretch outline lists only its stretch.
  */
 function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall): SessionEntry[] {
 	const outlineIndex = base.entries.indexOf(outline.result);
+	const listed = outline.stretch ? stretchEntryIds(base, outline.stretch) : new Set(base.entries.slice(0, outlineIndex).map(({ sourceEntry }) => sourceEntry.id));
 	const latestEdit = new Map<string, { index: number; replacement: ContextEditEntry["replacement"] }>();
 	base.entries.forEach(({ sourceEntry }, index) => {
 		if (sourceEntry.type === "context_edit") latestEdit.set(sourceEntry.targetId, { index, replacement: sourceEntry.replacement });
@@ -472,7 +512,7 @@ function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outl
 		.slice(0, outlineIndex)
 		.map(({ sourceEntry }) => sourceEntry)
 		.filter((entry) => {
-			if (!isEditable(entry) || (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === OUTLINE_TOOL)) return false;
+			if (!listed.has(entry.id) || !isEditable(entry) || (entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === OUTLINE_TOOL)) return false;
 			const edit = latestEdit.get(entry.id);
 			return edit !== undefined && edit.index > outlineIndex && edit.replacement === null;
 		});
@@ -562,15 +602,20 @@ const contextOutlineTool = defineTool({
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
 		`By default, user messages and entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are shown in full, and each run of smaller entries is one line with its bounds, size and thinking; set minTokens to change the threshold, 0 for every entry.`,
+		"With from and to, only the entries from one entry ID to another are listed, such as one run's bounds with minTokens 0, while the header still gives the whole context.",
 		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines after its earliest change.",
 	].join(" "),
 	parameters: Type.Object({
 		removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })),
 		minTokens: Type.Optional(Type.Number({ description: `Show entries of at least this many estimated tokens in full; default ${DEFAULT_MIN_TOKENS}, 0 for all` })),
+		from: Type.Optional(Type.String({ description: "First entry ID of a stretch to outline alone, such as a collapsed run's first bound; used with to" })),
+		to: Type.Optional(Type.String({ description: "Last entry ID of the stretch, inclusive; used with from" })),
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
+		if ((parameters.from === undefined) !== (parameters.to === undefined)) throw new Error("from and to go together: give both, such as a collapsed run's bounds");
+		const stretch = parameters.from === undefined ? undefined : { from: parameters.from, to: parameters.to! };
 		const projection = ctx.sessionManager.buildSessionProjection();
-		const text = parameters.removed ? removedOutlineOf(projection, ctx.model) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS, ctx.model);
+		const text = parameters.removed ? removedOutlineOf(projection, ctx.model) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS, ctx.model, stretch);
 		return { content: [{ type: "text" as const, text }] };
 	},
 });

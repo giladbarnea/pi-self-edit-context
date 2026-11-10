@@ -330,6 +330,38 @@ const scripts: Record<string, ScriptStep[]> = {
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		record,
 	],
+	"outline-stretch": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage([signedThinking("THINK-C"), readNull()]),
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 500 })),
+		(messages) => {
+			recordContext(messages);
+			const [, from, to] = lastToolResultText(messages).match(/^- … \d+ entries (\S+) → (\S+),/m)!;
+			return fauxAssistantMessage(fauxToolCall("context_outline", { from, to, minTokens: 0 }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const collapsedOutline = messages.filter((message) => message.role === "toolResult").at(-2).content[0].text as string;
+			const [, readD] = [...collapsedOutline.matchAll(/^- … \d+ entries (\S+) → /gm)].at(-1)!;
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${readD}.c0`, note: "D-NOTE" }] }));
+		},
+		record,
+	],
+	"outline-stretch-refusals": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const [readA, readB] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage([
+				fauxToolCall("context_outline", { from: readB, to: readA }),
+				fauxToolCall("context_outline", { from: `${readA}.c0`, to: readB }),
+			]);
+		},
+		record,
+	],
 	"outline-trail": [
 		() => fauxAssistantMessage(readNull()),
 		() => fauxAssistantMessage(readNull()),
