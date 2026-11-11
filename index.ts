@@ -1,5 +1,4 @@
 import { type AssistantMessage, type Model, Type } from "@earendil-works/pi-ai";
-import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import {
 	defineTool,
 	estimateTokens,
@@ -69,13 +68,20 @@ function blockTokens(block: Block): number {
 }
 
 /**
- * Estimated tokens of one block of an assistant message as Pi sends it to the current model: Pi's own transform drops
- * thinking another model wrote, with its signature, and whole failed or aborted messages, so those cost nothing.
+ * Whether Pi sends this block of an assistant message to the model. This mirrors pi-ai's transformMessages, which Pi does
+ * not expose to extensions: it drops whole failed or aborted messages, thinking another model wrote, with its signature,
+ * and blank unsigned thinking.
  */
+function isSent(message: AssistantMessage, block: Block, model: Model<string>): boolean {
+	if (message.stopReason === "error" || message.stopReason === "aborted") return false;
+	if (block.type !== "thinking") return true;
+	const sameModel = message.provider === model.provider && message.api === model.api && message.model === model.id;
+	return sameModel && Boolean(block.redacted || block.thinkingSignature || block.thinking?.trim());
+}
+
+/** Estimated tokens of one block of an assistant message as Pi sends it to the current model; a block Pi drops costs nothing. */
 function sentBlockTokens(message: AssistantMessage, block: Block, model: CurrentModel): number {
-	if (!model) return blockTokens(block);
-	const sent = transformMessages([{ ...message, content: [block] }], model).some((candidate) => candidate.role === "assistant" && candidate.content.length > 0);
-	return sent ? blockTokens(block) : 0;
+	return !model || isSent(message, block, model) ? blockTokens(block) : 0;
 }
 
 function sentContentTokens(message: AssistantMessage, blocks: Block[], model: CurrentModel): number {
