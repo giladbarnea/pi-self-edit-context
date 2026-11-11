@@ -1,7 +1,7 @@
 // A deterministic stand-in for the model. It acts like an agent that edits its own context:
 // it reads the outline, picks targets by role and text, edits them, then records what it sees next.
 import { appendFileSync } from "node:fs";
-import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type ScriptStep = (messages: any[], context: any) => ReturnType<typeof fauxAssistantMessage>;
@@ -33,6 +33,17 @@ function signedThinking(label: string) {
 }
 
 const readNull = () => fauxToolCall("read", { path: "/dev/null" });
+/** Turns the extra tool on or off mid-turn, so Pi records a system entry (toolsAdded or toolsRemoved) after the call's result. */
+const toggleExtra = () => fauxAssistantMessage(fauxToolCall("toggle_extra", {}));
+
+/** The result entry nested under a call block in an outline. */
+function resultIdOfCall(outline: string, callBlockId: string): string {
+	const lines = outline.split("\n");
+	const callLine = lines.findIndex((line) => line.startsWith(`  - ${callBlockId} call`));
+	const result = lines[callLine + 1]?.match(/^    - (\S+) result/);
+	if (!result) throw new Error(`No result under ${callBlockId} in outline:\n${outline}`);
+	return result[1];
+}
 /** Deterministic random numbers, so a failing monkey run replays from its seed. */
 function seededRandom(seed: number): () => number {
 	return () => {
@@ -71,7 +82,7 @@ function observe(messages: any[]): Observation {
 function createMonkey(seed: number, acts: number): ScriptStep {
 	const random = seededRandom(seed);
 	const pick = <T>(items: T[]): T => items[Math.floor(random() * items.length)];
-	let next: "observe" | "act" | "after-act" | "final-observe" | "restore-all" | "finish" = "observe";
+	let next: "start" | "observe" | "act" | "after-act" | "final-observe" | "restore-all" | "finish" = "start";
 	let actCount = 0;
 	let noteCount = 0;
 	const note = () => `NOTE-${seed}-${++noteCount}`;
@@ -92,6 +103,7 @@ function createMonkey(seed: number, acts: number): ScriptStep {
 	};
 
 	const work = () => {
+		if (random() < 0.4) return toggleExtra();
 		const content: any[] = [];
 		if (random() < 0.6) content.push(signedThinking(`THINK-${seed}-${++noteCount}`));
 		if (random() < 0.4) content.push(fauxText(`TEXT-${seed}-${++noteCount}`));
@@ -132,6 +144,10 @@ function createMonkey(seed: number, acts: number): ScriptStep {
 	return (messages) => {
 		recordContext(messages);
 		switch (next) {
+			case "start":
+				// Every run then has at least one mid-turn system entry; work() toggles again at random.
+				next = "observe";
+				return toggleExtra();
 			case "observe":
 				next = "act";
 				return observeCalls();
@@ -175,6 +191,9 @@ const record: ScriptStep = (messages) => {
 	recordContext(messages);
 	return fauxAssistantMessage("done");
 };
+
+/** IDs a system-entry script reads from an outline that a later step's edit folds away. */
+const systemEntryIds: { third?: string; user?: string; end?: string } = {};
 
 const scripts: Record<string, ScriptStep[]> = {
 	"pirate-first-request": [
@@ -362,6 +381,45 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	// A1 turns the extra tool on and A3 turns it off, so a system entry follows R1 and R3; A4 outlines.
+	"system-entry-folds-refused": [
+		toggleExtra,
+		() => fauxAssistantMessage(readNull()),
+		toggleExtra,
+		outline,
+		(messages) => {
+			const outlineText = lastToolResultText(messages);
+			const [first, , third] = assistantEntryIds(outlineText);
+			systemEntryIds.third = third;
+			const end = resultIdOfCall(outlineText, `${third}.c0`);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ foldRange: { from: first, to: end, note: "RANGE-NOTE" } }], dryRun: true }));
+		},
+		(messages) => {
+			recordContext(messages);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${systemEntryIds.third}.c0`, note: "FOLD-NOTE" }] }));
+		},
+		record,
+	],
+	"system-entry-folds-valid": [
+		toggleExtra,
+		() => fauxAssistantMessage(readNull()),
+		toggleExtra,
+		outline,
+		(messages) => {
+			const outlineText = lastToolResultText(messages);
+			const [, second, third] = assistantEntryIds(outlineText);
+			systemEntryIds.user = outlineId(outlineText, "user", "ORIGINAL-REQUEST");
+			systemEntryIds.end = resultIdOfCall(outlineText, `${third}.c0`);
+			// The read's result is followed by an assistant message, not a system entry, so its note may sit between two assistants.
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${second}.c0`, note: "READ-NOTE" }] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			// Starting at the user message makes it the note's holder, so the system entries after the range follow a user message.
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ foldRange: { from: systemEntryIds.user, to: systemEntryIds.end, note: "RANGE-NOTE" } }] }));
+		},
+		record,
+	],
 	"outline-trail": [
 		() => fauxAssistantMessage(readNull()),
 		() => fauxAssistantMessage(readNull()),
@@ -489,6 +547,27 @@ if (scriptName === "monkey") {
 }
 
 export default function (pi: ExtensionAPI): void {
+	pi.registerTool({
+		name: "toggle_extra",
+		label: "Toggle extra",
+		description: "Turn the extra tool on or off.",
+		parameters: Type.Object({}),
+		async execute() {
+			const active = pi.getActiveTools();
+			pi.setActiveTools(active.includes("extra") ? active.filter((name) => name !== "extra") : [...active, "extra"]);
+			return { content: [{ type: "text" as const, text: "toggled" }], details: {} };
+		},
+	});
+	pi.registerTool({
+		name: "extra",
+		label: "Extra",
+		description: "An extra tool that is off at the start.",
+		parameters: Type.Object({}),
+		async execute() {
+			return { content: [{ type: "text" as const, text: "extra" }], details: {} };
+		},
+	});
+	pi.on("session_start", () => pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "extra")));
 	if (reportedPromptTokens) {
 		pi.on("message_end", (event) => {
 			if (event.message.role !== "assistant") return;

@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { rejectionsPerRequest } from "./fixtures/anthropic-request.mjs";
 import { GPT_MODEL, GPT_THINKING_BLOCKS, writeCrossModelSession } from "./fixtures/cross-model-session.mjs";
 
 const root = new URL("..", import.meta.url).pathname;
@@ -330,6 +331,38 @@ test("restoring a result also restores the entry holding its call", () => {
 	assert.match(report, /^Applied/, `restoring the result should apply: ${report}`);
 	assert.deepEqual(contextAfterEdit.find((message) => message.role === "assistant").content, readA.message.content, "the call's entry should be restored");
 	assert.ok(contextAfterEdit.some((message) => message.role === "toolResult" && message.toolCallId === readA.message.content[0].id), "the result should be back");
+});
+
+/** The system entries Pi recorded mid-session, after the user's prompt: here, each follows a toggle_extra result. */
+const midSessionSystemEntries = (entries) => entries.slice(entries.findIndex((entry) => entry.type === "message" && entry.message.role === "user")).filter((entry) => entry.type === "message" && entry.message.role === "system");
+
+test("an edit that would leave a system entry right after an assistant message is refused by the dry run and the apply", async () => {
+	// A1 turns a tool on, A2 reads, A3 turns it off: Pi records S1 after A1's result and S2 after A3's, and A4 outlines.
+	// Folding A1 → R3 into A1, or A3's call into a note, would put S1 or S2 between two assistant messages (issue 7).
+	const { contexts, entries } = runAgent("system-entry-folds-refused", "ORIGINAL-REQUEST: anything");
+	const [first, , third, fourth] = messageEntries(entries, "assistant");
+	const [firstSystem, secondSystem] = midSessionSystemEntries(entries);
+	assert.ok(firstSystem && secondSystem, `Pi should record a system entry after each toggle: ${JSON.stringify(entries.map((entry) => entry.message?.role ?? entry.type))}`);
+	const dryRun = contexts[0].findLast((message) => message.role === "toolResult");
+	assert.equal(dryRun.isError, true, `the dry run should report the problem: ${textOf(dryRun)}`);
+	assert.match(textOf(dryRun), new RegExp(`system entry ${firstSystem.id} would directly follow assistant message ${first.id}, which Anthropic rejects; keep a user message or tool result between ${first.id} and ${fourth.id}`), `dry run: ${textOf(dryRun)}`);
+	const apply = contexts[1].findLast((message) => message.role === "toolResult");
+	assert.equal(apply.isError, true, `the fold should be refused: ${textOf(apply)}`);
+	assert.match(textOf(apply), new RegExp(`^No edits applied, because system entry ${secondSystem.id} would directly follow assistant message ${third.id}`), `apply: ${textOf(apply)}`);
+	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a refused edit was persisted");
+	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
+});
+
+test("folds that keep a user message or tool result before each system entry still apply, and Anthropic accepts the requests", async () => {
+	// Same session. A2's read is followed by A3, not a system entry, so its note may sit between two assistant messages.
+	// A range that starts at the user message makes it the note's holder, so S1 and S2 follow a user message.
+	const { contextAfterEdit, entries } = runAgent("system-entry-folds-valid", "ORIGINAL-REQUEST: anything");
+	assert.equal(midSessionSystemEntries(entries).length, 2, "Pi should record a system entry after each toggle");
+	const reports = entries.filter((entry) => entry.type === "message" && entry.message.toolName === "edit_context").map((entry) => textOf(entry.message));
+	assert.equal(reports.length, 2);
+	for (const report of reports) assert.match(report, /^Applied/, `the fold should apply: ${report}`);
+	assert.equal(textOf(contextAfterEdit.find((message) => message.role === "user")), "RANGE-NOTE", "the user message should hold the range's note");
+	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
 });
 
 test("an edit that would separate tool calls from their results is refused and changes nothing", () => {

@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { rejectionsPerRequest } from "./fixtures/anthropic-request.mjs";
 
 const root = new URL("..", import.meta.url).pathname;
 const SEEDS = (process.env.MONKEY_SEEDS ?? "1,2,3").split(",").map(Number);
@@ -62,7 +63,7 @@ function editCalls(entries) {
 }
 
 for (const seed of SEEDS) {
-	test(`monkey seed ${seed}: arbitrary edit sequences keep the context sound and fully restorable`, () => {
+	test(`monkey seed ${seed}: arbitrary edit sequences keep the context sound and fully restorable`, async () => {
 		const { run, contexts, entries, directory } = runMonkey(seed);
 		const where = `(seed ${seed}, session in ${directory})`;
 		assert.equal(run.status, 0, `pi exited ${run.status} ${where}: ${run.stderr}`);
@@ -72,6 +73,10 @@ for (const seed of SEEDS) {
 			const problems = sendProblems(context);
 			assert.deepEqual(problems, [], `request ${index + 1} was unsendable ${where}`);
 		});
+		// The monkey toggles a tool mid-turn, so Pi records system entries; Anthropic must accept every request around them.
+		const prompt = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "user");
+		assert.ok(entries.slice(prompt).some((entry) => entry.type === "message" && entry.message.role === "system"), `the monkey should leave mid-turn system entries ${where}`);
+		assert.deepEqual(await rejectionsPerRequest(entries), [], `Anthropic would reject a request ${where}`);
 
 		const calls = editCalls(entries);
 		const applied = calls.filter(({ result }) => !result.isError && textOf(result.content).startsWith("Applied"));

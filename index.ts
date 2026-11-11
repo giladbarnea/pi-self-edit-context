@@ -315,15 +315,41 @@ function projectWithEdits(sessionManager: ReadonlySessionManager, edits: Context
 	return preview.buildSessionProjection();
 }
 
+type Replayed = { entry: ProjectedEntry; message: ProjectedEntry["messages"][number] };
+
+/**
+ * Pi sends each later system entry directly before the next assistant message, and Anthropic rejects a system message right
+ * after an assistant message. So two assistant messages with a system entry between them need a user message or tool result between them too.
+ */
+function systemOrderProblems(replayed: Replayed[]): string[] {
+	const problems: string[] = [];
+	let previousAssistant: ProjectedEntry | undefined;
+	let heldSystem: ProjectedEntry | undefined;
+	let userSince = false;
+	for (const { entry, message } of replayed) {
+		if (message.role === "system") heldSystem ??= entry;
+		else if (message.role !== "assistant") userSince = true;
+		else {
+			if (previousAssistant && heldSystem && !userSince) {
+				const [system, before, after] = [heldSystem, previousAssistant, entry].map(({ sourceEntry }) => sourceEntry.id);
+				problems.push(`system entry ${system} would directly follow assistant message ${before}, which Anthropic rejects; keep a user message or tool result between ${before} and ${after}, for example start the fold at a user message so that it holds the note`);
+			}
+			[previousAssistant, heldSystem, userSince] = [entry, undefined, false];
+		}
+	}
+	return problems;
+}
+
 /** Problems that would make the edited context unsendable, naming entry and block IDs; the newest assistant's calls are still running. */
 function contextProblems(projection: SessionProjection): string[] {
 	// Pi does not replay failed or aborted assistant attempts, so their unanswered calls are not problems.
-	const sent = projection.entries.flatMap((entry) =>
+	const replayed: Replayed[] = projection.entries.flatMap((entry) =>
 		entry.messages
-			.filter((message) => message.role !== "system" && !(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")))
+			.filter((message) => !(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")))
 			.map((message) => ({ entry, message })),
 	);
-	const problems: string[] = [];
+	const sent = replayed.filter(({ message }) => message.role !== "system");
+	const problems = systemOrderProblems(replayed);
 	if (sent.length > 0 && !USER_ROLES.has(sent[0].message.role)) {
 		problems.push(`the context would start with ${sent[0].entry.sourceEntry.id}, a ${sent[0].message.role} message, instead of a user message`);
 	}

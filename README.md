@@ -52,7 +52,7 @@ Operations in one batch apply in order to a working copy of the context: `[{rest
 
 Every report, dry run or not, gives Pi's usage meter (a dry run's "Context now", an apply's "Context before this edit", since the meter updates only after the next response), the tokens freed, the earliest change and how many tokens after it lose the prompt cache once, and confirms every call still has its result. It returns a plan ID, and `{apply: planId}` commits that exact plan without resending it.
 
-Edits are refused, and change nothing, naming the entry or block at fault, if they would leave a call without its result or the reverse, make the context start with a non-user message, or touch the agent's current message.
+Edits are refused, and change nothing, naming the entry or block at fault, if they would leave a call without its result or the reverse, make the context start with a non-user message, put a Pi system entry (a prompt or tool-set update) between two assistant messages with no user message or tool result between them, or touch the agent's current message. Pi sends such a system entry right after the first assistant message, and Anthropic rejects that request. Starting a range at a user message avoids it, because the user message then holds the note.
 
 ## Outlines fold themselves
 
@@ -75,8 +75,8 @@ Each session gets an isolated home and agent directory, with no inherited creden
 The locked development version is Pi 1.5.0. CI also installs exact Pi 1.4.0 packages and checks the installed versions before testing.
 
 The CI workflow runs on pull requests, pushes to `main` and manual dispatch. It uses Node.js 22.19.0 and read-only repository permissions.
-The suite checks next-request edits, dry runs, the meter in edit reports, stretch outlines and their refusals, the planning guidance in both tool descriptions, saved plans, stable block IDs, call/result pairing, refusals, restores and outline folding.
+The suite checks next-request edits, dry runs, the meter in edit reports, stretch outlines and their refusals, the planning guidance in both tool descriptions, saved plans, stable block IDs, call/result pairing, system-entry order, refusals, restores and outline folding.
 It also opens a synthetic session that switched from GPT to another model and checks that the estimates ignore the GPT signatures Pi drops, while the same model posing as GPT still counts them.
 It also previews the package contents. CI does not publish packages or make model requests.
 
-`test/monkey.test.mjs` drives a seeded random agent through ~40 batches of folds, ranges, restores, thinking drops and block edits, valid or not, often using IDs remembered from older outlines, then restores everything. It checks that every request stays sendable, refusals and dry runs persist nothing, folds remove the result of the call their ID originally named, outline counts agree with the removed list, and full restore brings every message back byte for byte. `MONKEY_SEEDS=1,2,…` and `MONKEY_ACTS=n` widen the search.
+`test/monkey.test.mjs` drives a seeded random agent through ~40 batches of folds, ranges, restores, thinking drops and block edits, valid or not, often using IDs remembered from older outlines, and toggles a tool mid-turn so Pi records system entries, then restores everything. It checks that every request stays sendable, including that Anthropic's request rules accept it (each request is rebuilt offline through Pi's and pi-ai's Anthropic converter, in `test/fixtures/anthropic-request.mjs`), refusals and dry runs persist nothing, folds remove the result of the call their ID originally named, outline counts agree with the removed list, and full restore brings every message back byte for byte. `MONKEY_SEEDS=1,2,…` and `MONKEY_ACTS=n` widen the search.
