@@ -260,6 +260,8 @@ test("every outline with a threshold totals the entries it collapsed, against th
 	const [atDefault, at500, at1, at0, atMillion] = contexts[0].filter((message) => message.role === "toolResult").slice(-5).map(textOf);
 	const stretch = textOf(contexts[1].findLast((message) => message.role === "toolResult"));
 	const size = (text) => (text.endsWith("k") ? Number(text.slice(0, -1)) * 1000 : Number(text));
+	/** The values a displayed size can stand for: "3.8k" is rounded to 100 tokens, "950" to one. */
+	const sizeRange = (text) => (text.endsWith("k") ? [size(text) - 50, size(text) + 50] : [size(text) - 0.5, size(text) + 0.5]);
 	// The total must equal the sum of the run lines the same outline shows, and its share must use the header's estimate.
 	const checkTotal = (outline, threshold, label) => {
 		const [header, totalLine, ...lines] = outline.split("\n");
@@ -270,8 +272,13 @@ test("every outline with a threshold totals the entries it collapsed, against th
 		const runTokens = lines.map((line) => line.match(/^- … \d+ entr(?:y|ies) [^,]+, ~(\S+) est\./)?.[1]).filter(Boolean).map(size);
 		assert.equal(Number(total[2]), runEntries.reduce((sum, count) => sum + count, 0), `${label}: count vs the run lines:\n${outline}`);
 		assert.ok(Math.abs(size(total[3]) - runTokens.reduce((sum, tokens) => sum + tokens, 0)) <= 100 * Math.max(1, runTokens.length), `${label}: tokens vs the run lines:\n${outline}`);
-		const contextEstimate = size(header.match(/\(~(\S+) est\.\)(?:\.|, \d+ removed)/)[1]);
-		assert.ok(Math.abs(Number(total[4]) - (size(total[3]) / contextEstimate) * 100) <= 2, `${label}: share vs the header's estimate:\n${outline}`);
+		// The share comes from unrounded sizes, so it must fit some pair of values the two displayed sizes can stand for.
+		const [collapsedLow, collapsedHigh] = sizeRange(total[3]);
+		const [contextLow, contextHigh] = sizeRange(header.match(/\(~(\S+) est\.\)(?:\.|, \d+ removed)/)[1]);
+		const share = Number(total[4]);
+		const lowest = Math.max(0, (100 * collapsedLow) / contextHigh) - 0.5;
+		const highest = Math.min(100, contextLow > 0 ? (100 * collapsedHigh) / contextLow : 100) + 0.5;
+		assert.ok(lowest <= share && share <= highest, `${label}: share ${share}% vs the header's estimate, which allows ${lowest.toFixed(1)}-${highest.toFixed(1)}%:\n${outline}`);
 		return { entries: Number(total[2]), lines };
 	};
 	// At the default 2k, both reads and the entry making these calls are small: one run of 5 entries.
