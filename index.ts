@@ -366,8 +366,8 @@ type Replayed = { entry: ProjectedEntry; message: ProjectedEntry["messages"][num
  * Pi sends each later system entry directly before the next assistant message, and Anthropic rejects a system message right
  * after an assistant message. So two assistant messages with a system entry between them need a user message or tool result between them too.
  */
-function systemOrderProblems(replayed: Replayed[]): string[] {
-	const problems: string[] = [];
+function systemOrderProblems(replayed: Replayed[]): { system: string; before: string; after: string }[] {
+	const problems: { system: string; before: string; after: string }[] = [];
 	let previousAssistant: ProjectedEntry | undefined;
 	let heldSystem: ProjectedEntry | undefined;
 	let userSince = false;
@@ -377,7 +377,7 @@ function systemOrderProblems(replayed: Replayed[]): string[] {
 		else {
 			if (previousAssistant && heldSystem && !userSince) {
 				const [system, before, after] = [heldSystem, previousAssistant, entry].map(({ sourceEntry }) => sourceEntry.id);
-				problems.push(`system entry ${system} would directly follow assistant message ${before}, which Anthropic rejects; keep a user message or tool result between ${before} and ${after}, for example start the fold at a user message so that it holds the note`);
+				problems.push({ system, before, after });
 			}
 			[previousAssistant, heldSystem, userSince] = [entry, undefined, false];
 		}
@@ -385,16 +385,21 @@ function systemOrderProblems(replayed: Replayed[]): string[] {
 	return problems;
 }
 
-/** Problems that would make the edited context unsendable, naming entry and block IDs; the newest assistant's calls are still running. */
-function contextProblems(projection: SessionProjection): string[] {
-	// Pi does not replay failed or aborted assistant attempts, so their unanswered calls are not problems.
-	const replayed: Replayed[] = projection.entries.flatMap((entry) =>
+/** The messages Pi replays, with their entries: Pi does not replay failed or aborted assistant attempts. */
+function replayedOf(projection: SessionProjection): Replayed[] {
+	return projection.entries.flatMap((entry) =>
 		entry.messages
 			.filter((message) => !(message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")))
 			.map((message) => ({ entry, message })),
 	);
+}
+
+/** Problems that would make the edited context unsendable, naming entry and block IDs; the newest assistant's calls are still running. */
+function contextProblems(projection: SessionProjection): string[] {
+	const replayed = replayedOf(projection);
 	const sent = replayed.filter(({ message }) => message.role !== "system");
-	const problems = systemOrderProblems(replayed);
+	const problems = systemOrderProblems(replayed).map(({ system, before, after }) =>
+		`system entry ${system} would directly follow assistant message ${before}, which Anthropic rejects; keep a user message or tool result between ${before} and ${after}, for example start the fold at a user message so that it holds the note`);
 	if (sent.length > 0 && !USER_ROLES.has(sent[0].message.role)) {
 		problems.push(`the context would start with ${sent[0].entry.sourceEntry.id}, a ${sent[0].message.role} message, instead of a user message`);
 	}
@@ -650,23 +655,38 @@ function foldedOutlineNote(base: SessionProjection, batch: Draft[], outline: Out
 
 /**
  * Fold the earlier outlines that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
- * Outlines before the earliest change are left, since folding them would move the cache break earlier.
+ * Outlines before the earliest change are left, since folding them would move the cache break earlier. So is an outline whose fold
+ * would put a system entry right after an assistant message, which Anthropic rejects; `project` builds the context drafts would give.
  */
-function withOutlineFolds(base: SessionProjection, operations: Operation[], drafts: Draft[], model: CurrentModel): { drafts: Draft[]; note: string } {
+function withOutlineFolds(base: SessionProjection, operations: Operation[], drafts: Draft[], model: CurrentModel, project: (drafts: Draft[]) => SessionProjection): { drafts: Draft[]; note: string } {
 	if (editsOf(drafts).length === 0) return { drafts, note: "" };
 	const earliest = earliestChange(base, drafts).position;
 	const targeted = new Set(editsOf(drafts).map(({ targetId }) => targetId));
 	// An outline the batch already changes, such as one it restores, is the agent's own choice; leave it.
 	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id) && !targeted.has(call.entry.sourceEntry.id));
-	const folded = calls.filter((call) => call.position > earliest);
+	const after = calls.filter((call) => call.position > earliest);
 	const left = calls.filter((call) => call.position <= earliest);
+	const orderProblems = (candidate: Draft[]): Set<string> => new Set(systemOrderProblems(replayedOf(project(candidate))).map(({ system }) => system));
+	const existing = orderProblems(drafts);
+	// Each candidate is checked together with the folds already accepted, since two folds can misplace what neither does alone.
+	const accepted: Operation[] = [];
+	const misplaced = after.map((call) => {
+		const fold = { fold: call.blockId, note: "" };
+		const system = [...orderProblems(compileOperations(base, [...operations, ...accepted, fold]))].find((candidate) => !existing.has(candidate));
+		if (system === undefined) accepted.push(fold);
+		return system;
+	});
+	const folded = after.filter((_call, index) => misplaced[index] === undefined);
+	const skippedNote = after
+		.flatMap((call, index) => (misplaced[index] === undefined ? [] : [` Left in place, because folding it would put system entry ${misplaced[index]} right after an assistant message: outline ${call.blockId}.`]))
+		.join("");
 	const leftNote = left.length === 0
 		? ""
 		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result, model))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
-	if (folded.length === 0) return { drafts, note: leftNote };
+	if (folded.length === 0) return { drafts, note: leftNote + skippedNote };
 	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, drafts, call, model) }));
 	const foldedNote = ` Also folds ${folded.length} earlier outline${folded.length === 1 ? "" : "s"} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
-	return { drafts: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
+	return { drafts: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote + skippedNote };
 }
 
 /** Where the edits break the prompt cache, and how many estimated tokens from there on are reprocessed once. */
@@ -787,7 +807,8 @@ const editContextTool = defineTool({
 		} else {
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
 			const operations = parameters.operations as Operation[];
-			({ drafts, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model));
+			const project = (candidate: Draft[]): SessionProjection => projectWithEdits(sessionManager, [...queued, ...candidate]);
+			({ drafts, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model, project));
 			breakdown = operationBreakdown(sessionManager, queued, base, operations, ctx.model);
 		}
 

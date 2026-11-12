@@ -440,6 +440,29 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	// A1 reads; A2 outlines, and an event turns a tool on after its result; A3 folds the read. The fold's batch would also
+	// fold A2's outline, which would leave A2's note, then the system entry, then the next assistant message.
+	"automatic-fold-before-system-entry": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 0 })),
+		(messages) => {
+			const [read] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${read}.c0`, note: "READ-NOTE" }] }));
+		},
+		record,
+	],
+	// The same, with two outline calls in one message and the system entry after both results: folding either alone leaves
+	// the other result between the outline's entry and the system entry, folding both does not.
+	"automatic-folds-of-one-entry-before-system-entry": [
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage([fauxToolCall("context_outline", { minTokens: 0 }), fauxToolCall("context_outline", { removed: true })]),
+		(messages) => {
+			const outlineText = messages.filter((message) => message.role === "toolResult").at(-2).content[0].text as string;
+			const [read] = assistantEntryIds(outlineText);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${read}.c0`, note: "READ-NOTE" }] }));
+		},
+		record,
+	],
 	"outline-trail": [
 		() => fauxAssistantMessage(readNull()),
 		() => fauxAssistantMessage(readNull()),
@@ -620,6 +643,16 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 	pi.on("session_start", () => pi.setActiveTools(pi.getActiveTools().filter((name) => name !== "extra")));
+	// With $SCRIPTED_MODEL_TOOLS_ON_OUTLINE, each outline's result turns the extra tool on or off ("on": only on) from an event,
+	// as another extension might: Pi then records a system entry after that result, with no tool-changing call in the outline's message.
+	if (process.env.SCRIPTED_MODEL_TOOLS_ON_OUTLINE) {
+		pi.on("tool_result", (event) => {
+			if (event.toolName !== "context_outline") return;
+			const active = pi.getActiveTools();
+			const off = active.includes("extra") && process.env.SCRIPTED_MODEL_TOOLS_ON_OUTLINE !== "on";
+			pi.setActiveTools(off ? active.filter((name) => name !== "extra") : [...new Set([...active, "extra"])]);
+		});
+	}
 	if (reportedPromptTokens) {
 		pi.on("message_end", (event) => {
 			if (event.message.role !== "assistant") return;

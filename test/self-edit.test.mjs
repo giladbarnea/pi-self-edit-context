@@ -389,6 +389,33 @@ test("folds that keep a user message or tool result before each system entry sti
 	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
 });
 
+test("an automatic outline fold that would leave a system entry right after an assistant message is skipped, and the agent's fold applies", async () => {
+	// An event turned a tool on after the outline's result, so a system entry follows it with no call in the outline's message.
+	const { contextAfterEdit, entries } = runAgent("automatic-fold-before-system-entry", "ORIGINAL-REQUEST: anything", { SCRIPTED_MODEL_TOOLS_ON_OUTLINE: "1" });
+	const [read, outlineEntry] = messageEntries(entries, "assistant");
+	const [systemEntry] = midSessionSystemEntries(entries);
+	assert.ok(systemEntry && entries.indexOf(systemEntry) > entries.indexOf(outlineEntry), `Pi should record a system entry after the outline: ${JSON.stringify(entries.map((entry) => entry.message?.role ?? entry.type))}`);
+	const report = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));
+	assert.match(report, /^Applied/, `the agent's fold should apply: ${report}`);
+	assert.match(report, new RegExp(`Left in place, because folding it would put system entry ${systemEntry.id} right after an assistant message: outline ${outlineEntry.id}\\.c0`), `the report should name the skipped outline: ${report}`);
+	assert.ok(contextAfterEdit.some((message) => message.role === "toolResult" && message.toolCallId === outlineEntry.message.content[0].id), "the outline should stay in context");
+	assert.equal(textOf(contextAfterEdit.find((message) => message.role === "assistant")), "READ-NOTE", `the read ${read.id} should be folded`);
+	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
+});
+
+test("automatic outline folds are accepted together: of two outline calls in one entry, only one is folded when folding both would misplace the system entry", async () => {
+	// Folding either call alone leaves the other's result as a separator; each candidate is checked against those already accepted.
+	const { contextAfterEdit, entries } = runAgent("automatic-folds-of-one-entry-before-system-entry", "ORIGINAL-REQUEST: anything", { SCRIPTED_MODEL_TOOLS_ON_OUTLINE: "on" });
+	const [, outlineEntry] = messageEntries(entries, "assistant");
+	const [systemEntry] = midSessionSystemEntries(entries);
+	assert.ok(systemEntry && entries.indexOf(systemEntry) > entries.indexOf(outlineEntry), `Pi should record a system entry after both outline results: ${JSON.stringify(entries.map((entry) => entry.message?.role ?? entry.type))}`);
+	const report = textOf(contextAfterEdit.findLast((message) => message.role === "toolResult"));
+	assert.match(report, /^Applied/, `the agent's fold should apply: ${report}`);
+	assert.match(report, new RegExp(`Also folds 1 earlier outline after the earliest change \\(${outlineEntry.id}\\.c0\\)`), `the first outline call should be folded: ${report}`);
+	assert.match(report, new RegExp(`Left in place, because folding it would put system entry ${systemEntry.id} right after an assistant message: outline ${outlineEntry.id}\\.c1`), `the second should be left: ${report}`);
+	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
+});
+
 test("an edit that would separate tool calls from their results is refused and changes nothing", () => {
 	const { contextAfterEdit, entries } = runAgent("orphan-tool-results", "ORIGINAL-REQUEST: anything");
 	assert.ok(!entries.some((entry) => entry.type === "context_edit"), "a broken edit was persisted");
