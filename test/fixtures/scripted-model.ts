@@ -349,6 +349,26 @@ const scripts: Record<string, ScriptStep[]> = {
 		() => fauxAssistantMessage(fauxToolCall("context_outline", {})),
 		record,
 	],
+	// Read A (signed thinking, ~1.0k est.) and read B are small; one entry asks for five outlines at once,
+	// then a default-threshold stretch over the run's bounds.
+	"small-entry-totals": [
+		() => fauxAssistantMessage([signedThinking("THINK-A"), readNull()]),
+		() => fauxAssistantMessage(readNull()),
+		() => fauxAssistantMessage([
+			fauxToolCall("context_outline", {}),
+			fauxToolCall("context_outline", { minTokens: 500 }),
+			fauxToolCall("context_outline", { minTokens: 1 }),
+			fauxToolCall("context_outline", { minTokens: 0 }),
+			fauxToolCall("context_outline", { minTokens: 1_000_000 }),
+		]),
+		(messages) => {
+			recordContext(messages);
+			const defaultOutline = messages.filter((message) => message.role === "toolResult").at(-5).content[0].text as string;
+			const [, from, to] = defaultOutline.match(/^- … \d+ entries (\S+) → (\S+),/m)!;
+			return fauxAssistantMessage(fauxToolCall("context_outline", { from, to }));
+		},
+		record,
+	],
 	"outline-stretch": [
 		() => fauxAssistantMessage(readNull()),
 		() => fauxAssistantMessage(readNull()),

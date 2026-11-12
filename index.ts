@@ -279,9 +279,11 @@ function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens
 	const shown = stretch ? stretchOf(units, stretch) : units;
 	const total = totalTokens(projection, model);
 	const body: string[] = [];
+	const collapsed: OutlineUnit[] = [];
 	let run: OutlineUnit[] = [];
 	const flush = (): void => {
 		if (run.length > 0) body.push(collapsedLine(run));
+		collapsed.push(...run);
 		run = [];
 	};
 	for (const unit of shown) {
@@ -299,7 +301,18 @@ function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens
 	const collapseNote = minTokens > 0
 		? ` Entries under ${formatTokens(minTokens)} est. are collapsed into runs with their bounds; {"minTokens": 0} shows every entry; add {"from": id, "to": id} to show only the entries from one ID to another, such as a run's bounds.`
 		: "";
-	return [`${scope}${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`, ...body].join("\n");
+	const smallEntries = minTokens > 0 ? [smallEntriesLine(collapsed, minTokens, total)] : [];
+	return [`${scope}${removedNote}. ${meterLine(usage)} ${ESTIMATE_NOTE}${collapseNote}`, ...smallEntries, ...body].join("\n");
+}
+
+/**
+ * The total of the entries this outline collapsed into runs, against the whole context's estimate.
+ * @example smallEntriesLine([unit("a1", 2, 300, 0), unit("b2", 1, 200, 50)], 2000, 1000) === "Small entries (under 2.0k each): 3 entries, ~500, 50% of the context."
+ */
+function smallEntriesLine(collapsed: OutlineUnit[], minTokens: number, total: number): string {
+	const { entries, tokens } = totalsOf(collapsed);
+	const share = total > 0 ? Math.round((tokens / total) * 100) : 0;
+	return `Small entries (under ${formatTokens(minTokens)} each): ${entries} entr${entries === 1 ? "y" : "ies"}, ~${formatTokens(tokens)}, ${share}% of the context.`;
 }
 
 /** The entries edits removed from context, with their original size and first line, for restore. */

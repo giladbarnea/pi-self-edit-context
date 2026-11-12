@@ -255,6 +255,44 @@ test("the default outline collapses small entries into runs that keep their boun
 	assert.ok(lines.includes(`- … 5 entries ${firstRead.id} → ${outlineCall.id}, ~1.0k est., ~1.0k est. in thinking`), `run line missing or wrong:\n${outline}`);
 });
 
+test("every outline with a threshold totals the entries it collapsed, against the whole context's estimate", () => {
+	const { contexts } = runAgent("small-entry-totals", "ORIGINAL-REQUEST: anything");
+	const [atDefault, at500, at1, at0, atMillion] = contexts[0].filter((message) => message.role === "toolResult").slice(-5).map(textOf);
+	const stretch = textOf(contexts[1].findLast((message) => message.role === "toolResult"));
+	const size = (text) => (text.endsWith("k") ? Number(text.slice(0, -1)) * 1000 : Number(text));
+	// The total must equal the sum of the run lines the same outline shows, and its share must use the header's estimate.
+	const checkTotal = (outline, threshold, label) => {
+		const [header, totalLine, ...lines] = outline.split("\n");
+		const total = totalLine.match(/^Small entries \(under (\S+) each\): (\d+) entr(?:y|ies), ~(\S+), (\d+)% of the context\.$/);
+		assert.ok(total, `${label}: the line under the header should be the small-entry total:\n${outline}`);
+		assert.equal(total[1], threshold, `${label}: the threshold should follow minTokens: ${totalLine}`);
+		const runEntries = lines.map((line) => line.match(/^- … (\d+) entr/)?.[1]).filter(Boolean).map(Number);
+		const runTokens = lines.map((line) => line.match(/^- … \d+ entr(?:y|ies) [^,]+, ~(\S+) est\./)?.[1]).filter(Boolean).map(size);
+		assert.equal(Number(total[2]), runEntries.reduce((sum, count) => sum + count, 0), `${label}: count vs the run lines:\n${outline}`);
+		assert.ok(Math.abs(size(total[3]) - runTokens.reduce((sum, tokens) => sum + tokens, 0)) <= 100 * Math.max(1, runTokens.length), `${label}: tokens vs the run lines:\n${outline}`);
+		const contextEstimate = size(header.match(/\(~(\S+) est\.\)(?:\.|, \d+ removed)/)[1]);
+		assert.ok(Math.abs(Number(total[4]) - (size(total[3]) / contextEstimate) * 100) <= 2, `${label}: share vs the header's estimate:\n${outline}`);
+		return { entries: Number(total[2]), lines };
+	};
+	// At the default 2k, both reads and the entry making these calls are small: one run of 5 entries.
+	assert.equal(checkTotal(atDefault, "2.0k", "default").entries, 5);
+	// At 500, read A (~1.0k) shows in full, so B, its result and the calling entry remain.
+	assert.equal(checkTotal(at500, "500", "minTokens 500").entries, 3);
+	// At 1, every entry is at least one token, so nothing collapses and the total says so.
+	const none = checkTotal(at1, "1", "minTokens 1");
+	assert.equal(none.entries, 0);
+	assert.ok(at1.split("\n")[1] === "Small entries (under 1 each): 0 entries, ~0, 0% of the context.", `zero collapsed: ${at1.split("\n")[1]}`);
+	// A huge threshold collapses everything but the user message, the system entry included.
+	assert.equal(checkTotal(atMillion, "1000.0k", "minTokens 1M").entries, 6);
+	// minTokens 0 collapses nothing and adds no total: the outline is unchanged.
+	assert.ok(!at0.includes("Small entries"), `minTokens 0 should add no total:\n${at0}`);
+	assert.match(at0.split("\n")[1], /^- \S+ system, /, `minTokens 0: the first entry should follow the header:\n${at0}`);
+	// A stretch over that run, taken after the five outlines, totals only what it collapsed: the run's 5 entries
+	// plus the five outline results now nested under the calling entry. The share is still of the whole context.
+	assert.equal(checkTotal(stretch, "2.0k", "stretch").entries, 10);
+	assert.match(stretch.split("\n")[0], /^10 entries shown \(~[\d.]+k est\.\), from \S+ to \S+, of \d+ in context/, `stretch header: ${stretch.split("\n")[0]}`);
+});
+
 test("from and to outline only that stretch, at the given minTokens, and the header still gives the whole context", () => {
 	// Reads A and B form the first collapsed run at minTokens 500; C (signed thinking, ~1.0k) and D come after it.
 	const { contexts, entries } = runAgent("outline-stretch", "ORIGINAL-REQUEST: anything");
