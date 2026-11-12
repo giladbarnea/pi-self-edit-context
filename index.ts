@@ -11,7 +11,11 @@ import {
 	type SessionProjection,
 } from "@earendil-works/pi-coding-agent";
 
-type ContextEdit = { targetId: string; replacement: ContextEditEntry["replacement"] };
+type ContextEdit = { type: "context_edit"; targetId: string; replacement: ContextEditEntry["replacement"] };
+/** A fold's bead: the entry holding its note, and the range it folds, first and last entry IDs. */
+type Range = { holder: string; from: string; to: string };
+/** What an edit_context batch hands Pi at the turn boundary: context edits, then a custom entry for each new range. */
+type Draft = ContextEdit | { type: "custom"; customType: typeof RANGE_ENTRY; data: Range };
 type ProjectedEntry = SessionProjection["entries"][number];
 type Block = any;
 /** The session's current model, which decides what Pi sends; undefined when none is selected. */
@@ -30,11 +34,13 @@ const OUTLINE_TOOL = "context_outline";
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
 /** What an entry holds when edits remove every block in it, since Pi cannot send an empty message. */
 const EMPTIED_TEXT = "[content removed]";
+/** The custom entry type that stores ranges in the session, so restoring a note holder can bring back its range after a reload. */
+const RANGE_ENTRY = "self-edit-context.range";
 
-/** Edits queued this turn. Pi persists them at the turn boundary, before the next request. */
-const pendingEditsBySession = new Map<string, ContextEdit[]>();
+/** Drafts queued this turn. Pi persists them at the turn boundary, before the next request. */
+const pendingDraftsBySession = new Map<string, Draft[]>();
 /** Dry-run plans the agent can apply by ID without resending them. They live in memory, so a reload clears them. */
-const plansById = new Map<string, { sessionId: string; edits: ContextEdit[]; breakdown: string; outlineNote: string }>();
+const plansById = new Map<string, { sessionId: string; drafts: Draft[]; breakdown: string; outlineNote: string }>();
 let planCount = 0;
 
 function isEditable(entry: SessionEntry): boolean {
@@ -70,9 +76,9 @@ function blockTokens(block: Block): number {
 /**
  * Whether Pi sends this block of an assistant message to the model. This mirrors pi-ai's transformMessages, which Pi does
  * not expose to extensions: it drops whole failed or aborted messages, thinking another model wrote, with its signature,
- * and blank unsigned thinking.
+ * and blank unsigned thinking. Exported for test/is-sent-parity.test.mjs, which checks it against Pi's code.
  */
-function isSent(message: AssistantMessage, block: Block, model: Model<string>): boolean {
+export function isSent(message: AssistantMessage, block: Block, model: Model<string>): boolean {
 	if (message.stopReason === "error" || message.stopReason === "aborted") return false;
 	if (block.type !== "thinking") return true;
 	const sameModel = message.provider === model.provider && message.api === model.api && message.model === model.id;
@@ -327,11 +333,31 @@ function removedOutlineOf(projection: SessionProjection, model: CurrentModel): s
 	return [`${removed.length} entr${removed.length === 1 ? "y" : "ies"} removed by edits; {"restore": id} brings one back:`, ...lines].join("\n");
 }
 
-/** The projection Pi would build after appending the edits, through Pi's own validation, as its turn boundary does. */
-function projectWithEdits(sessionManager: ReadonlySessionManager, edits: ContextEdit[]): SessionProjection {
+/** The projection Pi would build after appending the drafts, through Pi's own validation, as its turn boundary does. */
+function projectWithEdits(sessionManager: ReadonlySessionManager, drafts: Draft[]): SessionProjection {
 	const preview = SessionManager.inMemory(sessionManager.getCwd(), undefined, [sessionManager.getHeader()!, ...sessionManager.getBranch()]);
-	for (const { targetId, replacement } of edits) preview.appendContextEdit(targetId, replacement);
+	for (const draft of drafts) {
+		if (draft.type === "context_edit") preview.appendContextEdit(draft.targetId, draft.replacement);
+		else preview.appendCustomEntry(draft.customType, draft.data);
+	}
 	return preview.buildSessionProjection();
+}
+
+function editsOf(drafts: Draft[]): ContextEdit[] {
+	return drafts.filter((draft): draft is ContextEdit => draft.type === "context_edit");
+}
+
+/** Ranges whose note holder has not been restored since the range was folded, in the order they were folded. */
+function liveRanges(projection: SessionProjection): Range[] {
+	const entryById = new Map(projection.entries.map(({ sourceEntry }) => [sourceEntry.id, sourceEntry]));
+	let ranges: Range[] = [];
+	for (const { sourceEntry } of projection.entries) {
+		if (sourceEntry.type === "custom" && sourceEntry.customType === RANGE_ENTRY) ranges.push(sourceEntry.data as Range);
+		if (sourceEntry.type !== "context_edit" || sourceEntry.replacement === null) continue;
+		const restored = JSON.stringify(sourceEntry.replacement.content) === JSON.stringify(originalContent(entryById.get(sourceEntry.targetId)!));
+		if (restored) ranges = ranges.filter((range) => range.holder !== sourceEntry.targetId);
+	}
+	return ranges;
 }
 
 type Replayed = { entry: ProjectedEntry; message: ProjectedEntry["messages"][number] };
@@ -396,9 +422,10 @@ type Content = Block[] | string | null;
 /**
  * Turn the agent's operations into context edits. Operations apply in order to a working copy of the context, so a later
  * operation sees what earlier ones did; the edits are the entries whose final content differs from the current context.
+ * Each fold's note is a bead: restoring its holder restores its range, and the ranges of older beads inside it, as stored.
  * Throws on any invalid operation.
  */
-function compileOperations(base: SessionProjection, operations: Operation[]): ContextEdit[] {
+function compileOperations(base: SessionProjection, operations: Operation[]): Draft[] {
 	const byId = new Map(base.entries.map((entry) => [entry.sourceEntry.id, entry]));
 	const latestAssistant = visibleEntries(base).findLast((entry) => entry.messages.at(-1)!.role === "assistant");
 	const currentOf = (entry: ProjectedEntry): Content => (entry.messages.length > 0 ? (entry.messages.at(-1)!.content as Block[] | string) : null);
@@ -428,6 +455,43 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 		return { entry, blocks, index };
 	};
 	const position = new Map(base.entries.map((entry, index) => [entry, index]));
+	let ranges = liveRanges(base);
+	const created: Range[] = [];
+	const hasNote = (entry: ProjectedEntry): boolean =>
+		contentOf(entry) !== null && stableBlockIds(entry.sourceEntry.id, asBlocks(originalContent(entry.sourceEntry)), blocksOf(entry)).some((id) => id.includes(".n"));
+	/** Fold from → to into one note on its first user or assistant message; the rest are removed. A note it hides is named in it. */
+	const foldStretch = (from: string, to: string, note: string, label: string): void => {
+		const start = position.get(present(from))!;
+		const end = position.get(present(to))!;
+		if (end < start) throw new Error(`${label} ends before it starts`);
+		// Entries Pi cannot edit, such as tool-declaration system messages, stay where they are.
+		const range = base.entries.slice(start, end + 1).filter((entry) => isEditable(entry.sourceEntry) && contentOf(entry) !== null);
+		const carrier = range.find((entry) => roleOf(entry) !== "toolResult");
+		if (!carrier) throw new Error(`${label} has no user or assistant message to hold the note`);
+		const hidden = range.filter(hasNote).map(({ sourceEntry }) => sourceEntry.id);
+		for (const entry of range) set(editable(entry.sourceEntry.id), null);
+		set(carrier, asText(carrier, hidden.length === 0 ? note : `${note} [Also hides the earlier notes on ${hidden.join(", ")}.]`));
+		const folded = { holder: carrier.sourceEntry.id, from, to };
+		ranges.push(folded);
+		created.push(folded);
+	};
+	/** The entry and everything that comes back with it: a call entry's results, a result's call entry, and a note holder's ranges. */
+	const restoreSet = (start: ProjectedEntry): ProjectedEntry[] => {
+		const restoring = new Set([start]);
+		for (const entry of restoring) {
+			const call = callEntryOfResult(entry);
+			if (call) restoring.add(call);
+			for (const block of asBlocks(originalContent(entry.sourceEntry))) {
+				const result = block.type === "toolCall" ? resultOfCall(entry, block.id) : undefined;
+				if (result) restoring.add(result);
+			}
+			for (const range of ranges.filter(({ holder }) => holder === entry.sourceEntry.id)) {
+				const members = base.entries.slice(position.get(byId.get(range.from)!)!, position.get(byId.get(range.to)!)! + 1);
+				for (const member of members) if (isEditable(member.sourceEntry)) restoring.add(member);
+			}
+		}
+		return [...restoring];
+	};
 	const resultOfCall = (callEntry: ProjectedEntry, callId: string): ProjectedEntry | undefined =>
 		base.entries.slice(position.get(callEntry)! + 1).find(({ sourceEntry }) => sourceEntry.type === "message" && sourceEntry.message.role === "toolResult" && sourceEntry.message.toolCallId === callId);
 	const callEntryOfResult = (resultEntry: ProjectedEntry): ProjectedEntry | undefined => {
@@ -439,25 +503,14 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 
 	for (const operation of operations) {
 		if ("restore" in operation) {
-			const target = editable(operation.restore);
-			// A result comes back with the entry holding its call; a call entry comes back with its results.
-			const entry = callEntryOfResult(target) ?? target;
-			if (entry === latestAssistant) throw new Error(`${operation.restore} belongs to your current message, whose call is still running`);
-			const results = asBlocks(originalContent(entry.sourceEntry))
-				.filter((block) => block.type === "toolCall")
-				.flatMap((call) => resultOfCall(entry, call.id) ?? []);
-			for (const candidate of [entry, ...results]) set(candidate, originalContent(candidate.sourceEntry) as Content);
+			const restoring = restoreSet(editable(operation.restore));
+			if (restoring.includes(latestAssistant!)) throw new Error(`${operation.restore} belongs to your current message, whose call is still running`);
+			for (const entry of restoring) set(entry, originalContent(entry.sourceEntry) as Content);
+			const restoredIds = new Set(restoring.map(({ sourceEntry }) => sourceEntry.id));
+			ranges = ranges.filter(({ holder }) => !restoredIds.has(holder));
 		} else if ("foldRange" in operation) {
 			const { from, to, note } = operation.foldRange;
-			const start = position.get(present(from))!;
-			const end = position.get(present(to))!;
-			if (end < start) throw new Error(`foldRange ${from} → ${to} ends before it starts`);
-			// Entries Pi cannot edit, such as tool-declaration system messages, stay where they are.
-			const range = base.entries.slice(start, end + 1).filter((entry) => isEditable(entry.sourceEntry) && contentOf(entry) !== null);
-			const carrier = range.find((entry) => roleOf(entry) !== "toolResult");
-			if (!carrier) throw new Error(`foldRange ${from} → ${to} has no user or assistant message to hold the note`);
-			for (const entry of range) set(editable(entry.sourceEntry.id), null);
-			set(carrier, asText(carrier, note));
+			foldStretch(from, to, note, `foldRange ${from} → ${to}`);
 		} else if ("dropThinking" in operation) {
 			const before = position.get(present(operation.dropThinking.before))!;
 			const kept = new Set(operation.dropThinking.except ?? []);
@@ -481,26 +534,46 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Co
 			if (blocks[index].type === "toolCall") throw new Error(`${operation.id} is a tool call; use fold to replace a call together with its result`);
 			const replacement = operation.replacement === null ? [] : [{ type: "text", text: operation.replacement }];
 			set(entry, [...blocks.slice(0, index), ...replacement, ...blocks.slice(index + 1)]);
+		} else if (operation.replacement === null) {
+			// The hint names the call only while its block is still in the call entry; otherwise the general refusal below applies.
+			const target = present(operation.id);
+			const call = callEntryOfResult(target);
+			const callId = (target.sourceEntry as { message: { toolCallId?: string } }).message.toolCallId;
+			const current = call && contentOf(call) !== null ? blocksOf(call) : [];
+			const index = current.findIndex((block) => block.type === "toolCall" && block.id === callId);
+			if (call && index >= 0) {
+				const callBlock = stableBlockIds(call.sourceEntry.id, asBlocks(originalContent(call.sourceEntry)), current)[index];
+				throw new Error(`${operation.id} is a tool result, which cannot hold a note; fold its call instead: {"fold": "${callBlock}", "note": ...}`);
+			}
+			// A deletion is a one-entry fold: it leaves a note that restores the entry.
+			foldStretch(operation.id, operation.id, `[Entry removed by edit_context; {"restore": "${operation.id}"} brings it back.]`, `removing ${operation.id}`);
 		} else {
 			const entry = present(operation.id);
-			set(entry, operation.replacement === null ? null : asText(entry, operation.replacement));
+			set(entry, asText(entry, operation.replacement));
 		}
 	}
 
-	return base.entries.flatMap((entry): ContextEdit[] => {
+	const edits = base.entries.flatMap((entry): ContextEdit[] => {
 		if (!working.has(entry.sourceEntry.id)) return [];
 		const content = working.get(entry.sourceEntry.id)!;
 		if (JSON.stringify(content) === JSON.stringify(currentOf(entry))) return [];
 		const emptied = Array.isArray(content) && content.length === 0;
 		const replacement = content === null ? null : { content: (emptied ? [{ type: "text", text: EMPTIED_TEXT }] : content) as ContextEditableContent };
-		return [{ targetId: entry.sourceEntry.id, replacement }];
+		return [{ type: "context_edit", targetId: entry.sourceEntry.id, replacement }];
 	});
+	// A range restored later in the same batch is not stored.
+	const stored = created.filter((range) => ranges.includes(range)).map((data): Draft => ({ type: "custom", customType: RANGE_ENTRY, data }));
+	return [...edits, ...stored];
 }
 
-/** Position of the earliest entry the edits change, in the current context. */
-function earliestChange(base: SessionProjection, edits: ContextEdit[]): number {
-	const editedIds = new Set(edits.map(({ targetId }) => targetId));
-	return visibleEntries(base).findIndex((entry) => editedIds.has(entry.sourceEntry.id));
+/**
+ * The earliest entry the edits change, and its position in the current context: the number of entries in context before it.
+ * A restored entry may not be in context yet.
+ */
+function earliestChange(base: SessionProjection, drafts: Draft[]): { id: string; position: number } {
+	const editedIds = new Set(editsOf(drafts).map(({ targetId }) => targetId));
+	const index = base.entries.findIndex(({ sourceEntry }) => editedIds.has(sourceEntry.id));
+	return { id: base.entries[index].sourceEntry.id, position: visibleEntries({ ...base, entries: base.entries.slice(0, index) }).length };
 }
 
 type OutlineCall = { entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number; stretch: Stretch | undefined };
@@ -545,14 +618,14 @@ function stretchEntryIds(base: SessionProjection, { from, to }: Stretch): Set<st
  * Entries an outline listed that are removed once the batch applies: those whose latest removal came after the outline was taken.
  * Entries already removed when it was taken are not in it; other outlines' results have notes of their own. A stretch outline lists only its stretch.
  */
-function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall): SessionEntry[] {
+function removedSinceOutline(base: SessionProjection, batch: Draft[], outline: OutlineCall): SessionEntry[] {
 	const outlineIndex = base.entries.indexOf(outline.result);
 	const listed = outline.stretch ? stretchEntryIds(base, outline.stretch) : new Set(base.entries.slice(0, outlineIndex).map(({ sourceEntry }) => sourceEntry.id));
 	const latestEdit = new Map<string, { index: number; replacement: ContextEditEntry["replacement"] }>();
 	base.entries.forEach(({ sourceEntry }, index) => {
 		if (sourceEntry.type === "context_edit") latestEdit.set(sourceEntry.targetId, { index, replacement: sourceEntry.replacement });
 	});
-	for (const { targetId, replacement } of batch) latestEdit.set(targetId, { index: base.entries.length, replacement });
+	for (const { targetId, replacement } of editsOf(batch)) latestEdit.set(targetId, { index: base.entries.length, replacement });
 	return base.entries
 		.slice(0, outlineIndex)
 		.map(({ sourceEntry }) => sourceEntry)
@@ -564,7 +637,7 @@ function removedSinceOutline(base: SessionProjection, batch: ContextEdit[], outl
 }
 
 /** The note a folded outline leaves: what it showed, which of its entries are removed, and how to get it back. */
-function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outline: OutlineCall, model: CurrentModel): string {
+function foldedOutlineNote(base: SessionProjection, batch: Draft[], outline: OutlineCall, model: CurrentModel): string {
 	const taken = outline.result.sourceEntry.timestamp.slice(11, 16);
 	const summary = outlineSummary(textOf(outline.result.messages.at(-1)!.content));
 	const removed = removedSinceOutline(base, batch, outline);
@@ -579,10 +652,10 @@ function foldedOutlineNote(base: SessionProjection, batch: ContextEdit[], outlin
  * Fold the earlier outlines that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
  * Outlines before the earliest change are left, since folding them would move the cache break earlier.
  */
-function withOutlineFolds(base: SessionProjection, operations: Operation[], edits: ContextEdit[], model: CurrentModel): { edits: ContextEdit[]; note: string } {
-	if (edits.length === 0) return { edits, note: "" };
-	const earliest = earliestChange(base, edits);
-	const targeted = new Set(edits.map(({ targetId }) => targetId));
+function withOutlineFolds(base: SessionProjection, operations: Operation[], drafts: Draft[], model: CurrentModel): { drafts: Draft[]; note: string } {
+	if (editsOf(drafts).length === 0) return { drafts, note: "" };
+	const earliest = earliestChange(base, drafts).position;
+	const targeted = new Set(editsOf(drafts).map(({ targetId }) => targetId));
 	// An outline the batch already changes, such as one it restores, is the agent's own choice; leave it.
 	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id) && !targeted.has(call.entry.sourceEntry.id));
 	const folded = calls.filter((call) => call.position > earliest);
@@ -590,31 +663,32 @@ function withOutlineFolds(base: SessionProjection, operations: Operation[], edit
 	const leftNote = left.length === 0
 		? ""
 		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result, model))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
-	if (folded.length === 0) return { edits, note: leftNote };
-	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, edits, call, model) }));
+	if (folded.length === 0) return { drafts, note: leftNote };
+	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, drafts, call, model) }));
 	const foldedNote = ` Also folds ${folded.length} earlier outline${folded.length === 1 ? "" : "s"} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
-	return { edits: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
+	return { drafts: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote };
 }
 
 /** Where the edits break the prompt cache, and how many estimated tokens from there on are reprocessed once. */
-function cacheBreak(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[], model: CurrentModel): { earliest: number; entries: number; reprocessed: number } {
+function cacheBreak(base: SessionProjection, edited: SessionProjection, drafts: Draft[], model: CurrentModel): { earliest: { id: string; position: number }; entries: number; reprocessed: number } {
 	const visible = visibleEntries(base);
-	const earliest = earliestChange(base, edits);
+	const earliest = earliestChange(base, drafts);
 	const positionById = new Map(visible.map((entry, index) => [entry.sourceEntry.id, index]));
 	const reprocessed = visibleEntries(edited)
-		.filter((entry) => (positionById.get(entry.sourceEntry.id) ?? Infinity) >= earliest)
+		.filter((entry) => (positionById.get(entry.sourceEntry.id) ?? Infinity) >= earliest.position)
 		.reduce((total, entry) => total + entryTokens(entry, model), 0);
 	return { earliest, entries: visible.length, reprocessed };
 }
 
 /** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
-function effectReport(base: SessionProjection, edited: SessionProjection, edits: ContextEdit[], model: CurrentModel): string {
-	const { earliest, entries, reprocessed } = cacheBreak(base, edited, edits, model);
+function effectReport(base: SessionProjection, edited: SessionProjection, drafts: Draft[], model: CurrentModel): string {
+	const { earliest, entries, reprocessed } = cacheBreak(base, edited, drafts, model);
+	const edits = editsOf(drafts);
 	const before = totalTokens(base, model);
 	const after = totalTokens(edited, model);
 	return [
 		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} est. tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
-		`Earliest change: ${visibleEntries(base)[earliest].sourceEntry.id}, entry ${earliest + 1} of ${entries}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
+		`Earliest change: ${earliest.id}, entry ${earliest.position + 1} of ${entries}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
 		"Every tool call still has its result.",
 	].join(" ");
 }
@@ -629,7 +703,7 @@ function operationLabel(operation: Operation): string {
 }
 
 /** Tokens each operation frees when applied alone, so the agent can judge which ones are worth their cache cost. */
-function operationBreakdown(sessionManager: ReadonlySessionManager, queued: ContextEdit[], base: SessionProjection, operations: Operation[], model: CurrentModel): string {
+function operationBreakdown(sessionManager: ReadonlySessionManager, queued: Draft[], base: SessionProjection, operations: Operation[], model: CurrentModel): string {
 	if (operations.length < 2) return "";
 	const before = totalTokens(base, model);
 	const parts = operations.map((operation) => {
@@ -671,11 +745,11 @@ const editContextTool = defineTool({
 	description: [
 		"Plan the whole reduction before you apply any of it, then apply it in one call. Read each entry before you replace it, not only its outline line, because once an edit applies you can no longer see the original. Write notes only about content that exists now; never refer to a summary you have not written yet.",
 		"Edit your own context window, using IDs from context_outline. Operations:",
-		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
+		"{id, replacement}: with an entry ID, replace the whole message's content with text, or remove the message with null, which leaves a short note in its place, like a one-entry foldRange; with a thinking or text block ID, replace just that block with a short text note, or drop it with null.",
 		"{fold: callBlockId, note}: replace a tool call with a text note and remove its result, in one step.",
 		"{dropThinking: {before: entryId, except?: [entry or block IDs]}}: drop every thinking block in the entries before that entry, except those named.",
-		`{restore: entryId}: bring an edited or removed entry back to its original content; a call entry comes back with its results, and a result with the entry holding its call.`,
-		"{foldRange: {from: entryId, to: entryId, note}}: replace a contiguous stretch of entries with one note you write; its first user or assistant message holds the note and the rest are removed. A range that would split a call from its result is refused.",
+		`{restore: entryId}: bring an edited or removed entry back to its original content; a call entry comes back with its results, and a result with the entry holding its call. A fold's note works like a collapsed toggle: restoring the entry that holds it brings back the whole range as stored, including older notes it hides, while restoring another member keeps the note.`,
+		"{foldRange: {from: entryId, to: entryId, note}}: replace a contiguous stretch of entries with one note you write; its first user or assistant message holds the note and the rest are removed; the note also names the earlier notes it hides. A range that would split a call from its result is refused.",
 		"When edits apply, earlier context_outline results after the earliest change are folded too, at no extra cache cost, each leaving a note that says what the outline showed, which of its entries are removed, and how to restore it.",
 		"Operations in one call apply in order, each to the result of the ones before it.",
 		"Edits take effect from your next request in this same run. The originals stay in the session file. Your current message cannot be edited.",
@@ -700,35 +774,35 @@ const editContextTool = defineTool({
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
 		const sessionManager = ctx.sessionManager;
 		const sessionId = sessionManager.getSessionId();
-		const queued = pendingEditsBySession.get(sessionId) ?? [];
+		const queued = pendingDraftsBySession.get(sessionId) ?? [];
 		const base = projectWithEdits(sessionManager, queued);
 
-		let edits: ContextEdit[];
+		let drafts: Draft[];
 		let breakdown: string;
 		let outlineNote: string;
 		if (parameters.apply !== undefined) {
 			const plan = plansById.get(parameters.apply);
 			if (!plan || plan.sessionId !== sessionId) throw new Error(`No dry-run plan ${parameters.apply} in this session; plans are lost on reload, so run the dry run again`);
-			({ edits, breakdown, outlineNote } = plan);
+			({ drafts, breakdown, outlineNote } = plan);
 		} else {
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
 			const operations = parameters.operations as Operation[];
-			({ edits, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model));
+			({ drafts, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model));
 			breakdown = operationBreakdown(sessionManager, queued, base, operations, ctx.model);
 		}
 
-		if (edits.length === 0) throw new Error("Nothing to apply: these operations leave the context as it is, for example restoring entries that are not edited");
-		const edited = projectWithEdits(sessionManager, [...queued, ...edits]);
+		if (editsOf(drafts).length === 0) throw new Error("Nothing to apply: these operations leave the context as it is, for example restoring entries that are not edited");
+		const edited = projectWithEdits(sessionManager, [...queued, ...drafts]);
 		const problems = contextProblems(edited);
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const report = effectReport(base, edited, edits, ctx.model) + outlineNote + breakdown;
+		const report = effectReport(base, edited, drafts, ctx.model) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;
-			plansById.set(planId, { sessionId, edits, breakdown, outlineNote });
+			plansById.set(planId, { sessionId, drafts, breakdown, outlineNote });
 			return { content: [{ type: "text" as const, text: `Dry run, nothing applied. Context now: ${meterReading(ctx.getContextUsage())}. ${report} To apply exactly this, call edit_context with {"apply": "${planId}"}.` }] };
 		}
-		pendingEditsBySession.set(sessionId, [...queued, ...edits]);
+		pendingDraftsBySession.set(sessionId, [...queued, ...drafts]);
 		if (parameters.apply !== undefined) plansById.delete(parameters.apply);
 		const meter = `Context before this edit: ${meterReading(ctx.getContextUsage())}; the meter updates after your next response.`;
 		return { content: [{ type: "text" as const, text: `Applied from your next request. ${meter} ${report}` }] };
@@ -740,9 +814,9 @@ export default function selfEditContext(pi: ExtensionAPI): void {
 	pi.registerTool(editContextTool);
 	pi.on("turn_end", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const edits = pendingEditsBySession.get(sessionId);
-		if (!edits) return;
-		pendingEditsBySession.delete(sessionId);
-		return { entries: [...event.entries, ...edits.map((edit) => ({ type: "context_edit" as const, ...edit }))] };
+		const drafts = pendingDraftsBySession.get(sessionId);
+		if (!drafts) return;
+		pendingDraftsBySession.delete(sessionId);
+		return { entries: [...event.entries, ...drafts] };
 	});
 }

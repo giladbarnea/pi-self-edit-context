@@ -1,13 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 const root = new URL("..", import.meta.url).pathname;
-
-const PACKAGE_NAME = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).name;
 
 /**
  * The package as users get it: the tarball `npm pack` builds, outside this checkout, so no node_modules is in reach and
@@ -47,12 +45,17 @@ test("a real Pi start loads the packed extension from a local path in settings, 
 	assertLoaded(startPi(directory, { packages: [join(directory, "package")] }));
 });
 
-test("a real Pi start loads the extension installed from its tarball as an npm package, without its peer dependencies", () => {
-	// Pi installs npm packages under <agent dir>/npm and leaves pi-ai and pi-coding-agent to its own loader.
+test("a real Pi start loads the extension as Pi's Git install leaves it, with dependencies installed but no dev or peer dependencies", () => {
+	// The package is not on the npm registry; the README installs it from Git. Pi's Git install clones the repository and
+	// runs `npm install --omit=dev --legacy-peer-deps` in it, so pi-ai and pi-coding-agent are left to Pi's own loader.
 	const directory = mkdtempSync(join(tmpdir(), "self-edit-live-load-"));
-	const npmRoot = join(directory, "agent", "npm");
-	mkdirSync(npmRoot, { recursive: true });
-	writeFileSync(join(npmRoot, "package.json"), "{}");
-	execFileSync("npm", ["install", "--legacy-peer-deps", "--no-audit", "--no-fund", packedTarball(directory)], { cwd: npmRoot, stdio: "pipe" });
-	assertLoaded(startPi(directory, { packages: [`npm:${PACKAGE_NAME}`] }));
+	const clone = join(directory, "clone");
+	mkdirSync(clone);
+	// The clone's files are what Git tracks here, so the package root must be its own Git work tree, as in CI and a real install.
+	const toplevel = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: root, encoding: "utf8" }).stdout.trim();
+	assert.equal(realpathSync(toplevel || "."), realpathSync(root), `this test needs the package root ${root} to be the top of its own Git work tree; git rev-parse --show-toplevel gave "${toplevel}". Run it in a Git clone of the package, not in an export inside another repository.`);
+	const files = execFileSync("git", ["ls-files", "-co", "--exclude-standard", "-z"], { cwd: root, encoding: "utf8" }).split("\0").filter(Boolean);
+	for (const file of files) cpSync(join(root, file), join(clone, file));
+	execFileSync("npm", ["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"], { cwd: clone, stdio: "pipe" });
+	assertLoaded(startPi(directory, { packages: [clone] }));
 });

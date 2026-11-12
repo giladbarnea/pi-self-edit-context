@@ -1,6 +1,6 @@
 // A deterministic stand-in for the model. It acts like an agent that edits its own context:
 // it reads the outline, picks targets by role and text, edits them, then records what it sees next.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxThinking, fauxToolCall, Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -561,6 +561,38 @@ const reportedPromptTokens = process.env.SCRIPTED_MODEL_PROMPT_TOKENS;
 
 const monkeySeed = Number(process.env.SCRIPTED_MODEL_SEED ?? 0);
 const monkeyActs = Number(process.env.SCRIPTED_MODEL_ACTS ?? 40);
+/**
+ * A plan script, from $SCRIPTED_MODEL_PLAN: "read" steps make reads; then one outline names them, and each {ops} step sends
+ * edit_context with symbols resolved: @U is the user message, @A1… the reads in order, @R1… their results, @O the outline's entry. The symbol table
+ * is saved to $SCRIPTED_MODEL_SYMBOLS, and a run that opens the same session later loads it instead of outlining again.
+ */
+function planSteps(plan: ("read" | { ops: object[] })[]): ScriptStep[] {
+	const symbolsPath = process.env.SCRIPTED_MODEL_SYMBOLS!;
+	const symbols: Record<string, string> = existsSync(symbolsPath) ? JSON.parse(readFileSync(symbolsPath, "utf8")) : {};
+	const learnSymbols = (outlineText: string): void => {
+		symbols.U = outlineId(outlineText, "user", "");
+		// The outline's own entry is the last assistant; its result is still being made.
+		const assistants = assistantEntryIds(outlineText);
+		symbols.O = assistants.at(-1)!;
+		assistants.slice(0, -1).forEach((id, index) => {
+			symbols[`A${index + 1}`] = id;
+			symbols[`R${index + 1}`] = resultIdOfCall(outlineText, `${id}.c0`);
+		});
+		writeFileSync(symbolsPath, JSON.stringify(symbols));
+	};
+	const resolve = (operations: object[]): object[] =>
+		JSON.parse(JSON.stringify(operations), (_key, value) => (typeof value === "string" ? value.replace(/@([AR]\d+|U|O)/g, (_match, symbol) => symbols[symbol] ?? `@${symbol}`) : value));
+	const reads = plan.filter((step) => step === "read").map(() => () => fauxAssistantMessage(readNull()));
+	const editSteps: ScriptStep[] = plan.flatMap((step) => (step === "read" ? [] : [step])).map((step, index) => (messages) => {
+		if (index === 0 && symbols.U === undefined) learnSymbols(lastToolResultText(messages));
+		else recordContext(messages);
+		return fauxAssistantMessage(fauxToolCall("edit_context", { operations: resolve(step.ops) }));
+	});
+	const outlineFirst = symbols.U === undefined ? [() => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 0 }))] : [];
+	return [...reads, ...outlineFirst, ...editSteps, record];
+}
+if (scriptName === "plan") scripts.plan = planSteps(JSON.parse(process.env.SCRIPTED_MODEL_PLAN!));
+
 if (scriptName === "monkey") {
 	const step = createMonkey(monkeySeed, monkeyActs);
 	scripts.monkey = Array.from({ length: monkeyActs * 6 + 20 }, () => step);

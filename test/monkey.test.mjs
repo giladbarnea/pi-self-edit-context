@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { rejectionsPerRequest } from "./fixtures/anthropic-request.mjs";
+import { uncoveredPerRequest } from "./fixtures/trail-coverage.mjs";
 
 const root = new URL("..", import.meta.url).pathname;
 const SEEDS = (process.env.MONKEY_SEEDS ?? "1,2,3").split(",").map(Number);
@@ -77,6 +78,8 @@ for (const seed of SEEDS) {
 		const prompt = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "user");
 		assert.ok(entries.slice(prompt).some((entry) => entry.type === "message" && entry.message.role === "system"), `the monkey should leave mid-turn system entries ${where}`);
 		assert.deepEqual(await rejectionsPerRequest(entries), [], `Anthropic would reject a request ${where}`);
+		// Restore trails: after every batch, not only after the final full restore, each removed entry is under a visible note.
+		assert.deepEqual(uncoveredPerRequest(entries), [], `a removed entry lost its note ${where}`);
 
 		const calls = editCalls(entries);
 		const applied = calls.filter(({ result }) => !result.isError && textOf(result.content).startsWith("Applied"));

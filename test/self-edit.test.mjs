@@ -1,33 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { rejectionsPerRequest } from "./fixtures/anthropic-request.mjs";
 import { GPT_MODEL, GPT_THINKING_BLOCKS, writeCrossModelSession } from "./fixtures/cross-model-session.mjs";
-
-const root = new URL("..", import.meta.url).pathname;
-
-/**
- * Run a real `pi -p` whose model is a scripted stand-in; return each context the model recorded and the session file.
- * `model` is "provider/id"; `session` is an existing session file to open instead of starting a new one.
- */
-function runAgent(script, prompt, extraEnvironment = {}, { model = "scripted/agent", session } = {}) {
-	const directory = mkdtempSync(join(tmpdir(), "self-edit-"));
-	const log = join(directory, "contexts.jsonl");
-	execFileSync(
-		join(root, "node_modules/.bin/pi"),
-		["-p", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-mcp",
-			"-e", join(root, "index.ts"), "-e", join(root, "test/fixtures/scripted-model.ts"),
-			"--model", model, "--session-dir", directory, ...(session ? ["--session", session] : []), prompt],
-		{ cwd: directory, env: { PATH: process.env.PATH, HOME: directory, PI_CODING_AGENT_DIR: join(directory, "agent"), SCRIPTED_MODEL_SCRIPT: script, SCRIPTED_MODEL_LOG: log, ...extraEnvironment }, stdio: "pipe", timeout: 60_000 },
-	);
-	const sessionFile = session ?? join(directory, readdirSync(directory).find((name) => name.endsWith(".jsonl") && name !== "contexts.jsonl"));
-	const contexts = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-	const entries = readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-	return { contexts, contextAfterEdit: contexts.at(-1), entries };
-}
+import { runAgent } from "./fixtures/run-agent.mjs";
 
 const textOf = (message) => (typeof message.content === "string" ? message.content : message.content.map((block) => block.text ?? "").join(""));
 const messageEntries = (entries, role) => entries.filter((entry) => entry.type === "message" && entry.message.role === role);
@@ -406,7 +384,8 @@ test("folds that keep a user message or tool result before each system entry sti
 	const reports = entries.filter((entry) => entry.type === "message" && entry.message.toolName === "edit_context").map((entry) => textOf(entry.message));
 	assert.equal(reports.length, 2);
 	for (const report of reports) assert.match(report, /^Applied/, `the fold should apply: ${report}`);
-	assert.equal(textOf(contextAfterEdit.find((message) => message.role === "user")), "RANGE-NOTE", "the user message should hold the range's note");
+	// The range also hides the read's note from the first fold, and its note says so.
+	assert.match(textOf(contextAfterEdit.find((message) => message.role === "user")), /^RANGE-NOTE \[Also hides the earlier notes on \w+\.\]$/, "the user message should hold the range's note");
 	assert.deepEqual(await rejectionsPerRequest(entries), [], "Anthropic would reject a request");
 });
 
