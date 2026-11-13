@@ -347,13 +347,15 @@ function editsOf(drafts: Draft[]): ContextEdit[] {
 	return drafts.filter((draft): draft is ContextEdit => draft.type === "context_edit");
 }
 
-/** Ranges whose note holder has not been restored since the range was folded, in the order they were folded. */
+/** Ranges whose note holder has not been restored since the range was folded, in the order they were folded.
+ * Compaction can retain edits whose targets were summarized away, which cannot restore a holder in this projection.
+ */
 function liveRanges(projection: SessionProjection): Range[] {
 	const entryById = new Map(projection.entries.map(({ sourceEntry }) => [sourceEntry.id, sourceEntry]));
 	let ranges: Range[] = [];
 	for (const { sourceEntry } of projection.entries) {
 		if (sourceEntry.type === "custom" && sourceEntry.customType === RANGE_ENTRY) ranges.push(sourceEntry.data as Range);
-		if (sourceEntry.type !== "context_edit" || sourceEntry.replacement === null) continue;
+		if (sourceEntry.type !== "context_edit" || sourceEntry.replacement === null || !entryById.has(sourceEntry.targetId)) continue;
 		const restored = JSON.stringify(sourceEntry.replacement.content) === JSON.stringify(originalContent(entryById.get(sourceEntry.targetId)!));
 		if (restored) ranges = ranges.filter((range) => range.holder !== sourceEntry.targetId);
 	}
