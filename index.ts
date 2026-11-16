@@ -396,8 +396,10 @@ function replayedOf(projection: SessionProjection): Replayed[] {
 	);
 }
 
-/** Problems that would make the edited context unsendable, naming entry and block IDs; the newest assistant's calls are still running. */
-function contextProblems(projection: SessionProjection): string[] {
+/** Message-order problems and checked/unmatched call IDs; the newest assistant's calls are still running. */
+function contextProblems(projection: SessionProjection): { problems: string[]; unmatchedCalls: string[]; calls: Set<string> } {
+	const calls = new Set<string>();
+	const unmatchedCalls: string[] = [];
 	const replayed = replayedOf(projection);
 	const sent = replayed.filter(({ message }) => message.role !== "system");
 	const problems = systemOrderProblems(replayed).map(({ system, before, after }) =>
@@ -409,19 +411,21 @@ function contextProblems(projection: SessionProjection): string[] {
 	const openCalls = new Map<string, string>();
 	sent.forEach(({ entry, message }, index) => {
 		if (message.role === "assistant") {
-			for (const blockId of openCalls.values()) problems.push(`call ${blockId} would lose its result`);
+			unmatchedCalls.push(...openCalls.values());
 			openCalls.clear();
 			const ids = blockIdsOf(entry);
 			message.content.forEach((block: Block, blockIndex: number) => {
-				if (block.type === "toolCall" && index !== lastAssistantIndex) openCalls.set(block.id, ids[blockIndex]);
+				if (block.type !== "toolCall" || index === lastAssistantIndex) return;
+				calls.add(ids[blockIndex]);
+				openCalls.set(block.id, ids[blockIndex]);
 			});
 		}
 		if (message.role === "toolResult" && !openCalls.delete(message.toolCallId) && index < lastAssistantIndex) {
 			problems.push(`result ${entry.sourceEntry.id} would lose its call`);
 		}
 	});
-	for (const blockId of openCalls.values()) problems.push(`call ${blockId} would lose its result`);
-	return problems;
+	unmatchedCalls.push(...openCalls.values());
+	return { problems, unmatchedCalls, calls };
 }
 
 type Content = Block[] | string | null;
@@ -703,7 +707,7 @@ function cacheBreak(base: SessionProjection, edited: SessionProjection, drafts: 
 }
 
 /** The effect of edits on the context: tokens freed, where the cache breaks, and how much is reprocessed. */
-function effectReport(base: SessionProjection, edited: SessionProjection, drafts: Draft[], model: CurrentModel): string {
+function effectReport(base: SessionProjection, edited: SessionProjection, drafts: Draft[], model: CurrentModel, hasUnmatchedCalls: boolean): string {
 	const { earliest, entries, reprocessed } = cacheBreak(base, edited, drafts, model);
 	const edits = editsOf(drafts);
 	const before = totalTokens(base, model);
@@ -711,7 +715,7 @@ function effectReport(base: SessionProjection, edited: SessionProjection, drafts
 	return [
 		`${edits.length} entr${edits.length === 1 ? "y" : "ies"} changed. ${before >= after ? "Frees" : "Adds"} ~${formatTokens(Math.abs(before - after))} est. tokens (~${formatTokens(before)} → ~${formatTokens(after)}).`,
 		`Earliest change: ${earliest.id}, entry ${earliest.position + 1} of ${entries}; ~${formatTokens(reprocessed)} est. tokens from there on are reprocessed without the prompt cache once.`,
-		"Every tool call still has its result.",
+		hasUnmatchedCalls ? "All previously paired calls and results stay together." : "Every tool call still has its result.",
 	].join(" ");
 }
 
@@ -816,9 +820,16 @@ const editContextTool = defineTool({
 
 		if (editsOf(drafts).length === 0) throw new Error("Nothing to apply: these operations leave the context as it is, for example restoring entries that are not edited");
 		const edited = projectWithEdits(sessionManager, [...queued, ...drafts]);
-		const problems = contextProblems(edited);
+		// Forks inherit in-flight parent calls; restoring one must also recover its original unmatched form.
+		const previous = contextProblems(base);
+		const original = projectWithEdits(sessionManager, base.entries
+			.filter(({ sourceEntry }) => isEditable(sourceEntry))
+			.map(({ sourceEntry }): ContextEdit => ({ type: "context_edit", targetId: sourceEntry.id, replacement: { content: originalContent(sourceEntry) as ContextEditableContent } })));
+		const inheritedCalls = new Set([...previous.unmatchedCalls, ...contextProblems(original).unmatchedCalls.filter((blockId) => !previous.calls.has(blockId))]);
+		const { problems, unmatchedCalls } = contextProblems(edited);
+		problems.push(...unmatchedCalls.filter((blockId) => !inheritedCalls.has(blockId)).map((blockId) => `call ${blockId} would lose its result`));
 		if (problems.length > 0) throw new Error(`No edits applied, because ${problems.join("; ")}`);
-		const report = effectReport(base, edited, drafts, ctx.model) + outlineNote + breakdown;
+		const report = effectReport(base, edited, drafts, ctx.model, unmatchedCalls.length > 0) + outlineNote + breakdown;
 
 		if (parameters.dryRun) {
 			const planId = `plan-${++planCount}`;

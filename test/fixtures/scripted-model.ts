@@ -589,7 +589,7 @@ const monkeyActs = Number(process.env.SCRIPTED_MODEL_ACTS ?? 40);
  * edit_context with symbols resolved: @U is the user message, @A1… the reads in order, @R1… their results, @O the outline's entry. The symbol table
  * is saved to $SCRIPTED_MODEL_SYMBOLS, and a run that opens the same session later loads it instead of outlining again.
  */
-function planSteps(plan: ("read" | { ops: object[] })[]): ScriptStep[] {
+function planSteps(plan: ("read" | { ops: object[]; dryRun?: boolean })[]): ScriptStep[] {
 	const symbolsPath = process.env.SCRIPTED_MODEL_SYMBOLS!;
 	const symbols: Record<string, string> = existsSync(symbolsPath) ? JSON.parse(readFileSync(symbolsPath, "utf8")) : {};
 	const learnSymbols = (outlineText: string): void => {
@@ -609,7 +609,7 @@ function planSteps(plan: ("read" | { ops: object[] })[]): ScriptStep[] {
 	const editSteps: ScriptStep[] = plan.flatMap((step) => (step === "read" ? [] : [step])).map((step, index) => (messages) => {
 		if (index === 0 && symbols.U === undefined) learnSymbols(lastToolResultText(messages));
 		else recordContext(messages);
-		return fauxAssistantMessage(fauxToolCall("edit_context", { operations: resolve(step.ops) }));
+		return fauxAssistantMessage(fauxToolCall("edit_context", { operations: resolve(step.ops), ...(step.dryRun ? { dryRun: true } : {}) }));
 	});
 	const outlineFirst = symbols.U === undefined ? [() => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 0 }))] : [];
 	return [...reads, ...outlineFirst, ...editSteps, record];
