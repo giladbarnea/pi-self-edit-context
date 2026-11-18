@@ -509,7 +509,9 @@ function compileOperations(base: SessionProjection, operations: Operation[]): Dr
 		const source = resultEntry.sourceEntry;
 		if (source.type !== "message" || source.message.role !== "toolResult") return undefined;
 		const callId = source.message.toolCallId;
-		return base.entries.slice(0, position.get(resultEntry)).findLast((entry) => asBlocks(originalContent(entry.sourceEntry)).some((block) => block.type === "toolCall" && block.id === callId));
+		return base.entries.slice(0, position.get(resultEntry)).findLast(({ sourceEntry }) =>
+			sourceEntry.type === "message" && sourceEntry.message.role === "assistant" &&
+			sourceEntry.message.content.some((block) => block.type === "toolCall" && block.id === callId));
 	};
 
 	for (const operation of operations) {
