@@ -83,11 +83,28 @@ test("both tool descriptions recommend planning the whole reduction, then applyi
 	const descriptionOf = (name) => tools.find((tool) => tool.name === name)?.description ?? `no ${name} tool reached the model: ${JSON.stringify(tools)}`;
 	const edit = descriptionOf("edit_context");
 	const outline = descriptionOf("context_outline");
-	assert.ok(edit.startsWith("Plan the whole reduction before you apply any of it, then apply it in one call."), `edit_context description: ${edit}`);
-	for (const phrase of ["once an edit applies you can no longer see the original", "never refer to a summary you have not written yet", "several small calls cost far more than one large call", "if you must edit in steps, outline again before the next step"]) {
-		assert.ok(edit.includes(phrase), `edit_context description lacks "${phrase}": ${edit}`);
-	}
-	assert.ok(!edit.includes("so batch edits into one call"), `the old cache-only wording should be replaced: ${edit}`);
+	assert.equal(edit, [
+		"Keep the information needed for your mission while removing context noise.",
+		"",
+		"Use context_outline to identify entries, then read the full content you intend to change. Fold irrelevant entries and useless whole-entry repetition. When needed information is buried in noise, use roughly 1:4 signal-to-noise or worse as a cue for individual editing. Keep the signal, shed the noise, and do not fold that entry.",
+		"",
+		"Remove passages that occupy a substantial part of their entries and recur often enough to add significant noise overall. Keep one complete copy of needed repeated information and refer to it where useful.",
+		"",
+		"Plan the full edit before applying it in one batch. Use IDs from the outline. Base replacements and notes only on content already present.",
+		"",
+		"Operations:",
+		"- {id, replacement}: replace an entry or a thinking/text block. null removes it. Removing an entry leaves a restorable bead.",
+		"- {fold: callBlockId, note}: replace a tool call and its result with one note.",
+		"- {foldRange: {from, to, note}}: replace a contiguous range with a note in its first user or assistant entry. Do not split an existing call/result pair.",
+		"- {dropThinking: {before, except}}: remove thinking before the named entry, except the named entries or blocks.",
+		"- {restore: entryId}: restore original content. Restoring a call or result also restores its partner. Restoring a fold's note holder restores the whole range, including older notes. Restoring another member keeps the note.",
+		"",
+		"dryRun previews the effects without changing context and returns a plan ID. It reports estimated tokens freed, cache rewrite cost, individual operation effects and pairing checks. {apply: planId} commits that exact plan. A refused edit changes nothing and explains why.",
+		"",
+		"Operations run in order. Edits take effect on the next request. Originals remain in the session file. You cannot edit your current message. Earlier affected outlines fold automatically, with notes explaining restoration.",
+		"",
+		"Everything after the earliest change is reprocessed without the prompt cache once. Batch changes to avoid paying that rewrite repeatedly.",
+	].join("\n"), "edit_context description should be the approved text");
 	assert.ok(outline.includes("Take one outline, plan the full set of edits from it, and apply them in a single edit_context call"), `context_outline description: ${outline}`);
 });
 
