@@ -86,9 +86,7 @@ test("both tool descriptions recommend planning the whole reduction, then applyi
 	assert.equal(edit, [
 		"Keep the information needed for your mission while removing context noise.",
 		"",
-		"Use context_outline to identify entries, then read the full content you intend to change. Fold irrelevant entries and useless whole-entry repetition. When needed information is buried in noise, use roughly 1:4 signal-to-noise or worse as a cue for individual editing. Keep the signal, shed the noise, and do not fold that entry.",
-		"",
-		"Remove passages that occupy a substantial part of their entries and recur often enough to add significant noise overall. Keep one complete copy of needed repeated information and refer to it where useful.",
+		"Use context_outline to identify entries, then read the full content you intend to change.",
 		"",
 		"Plan the full edit before applying it in one batch. Use IDs from the outline. Base replacements and notes only on content already present.",
 		"",
