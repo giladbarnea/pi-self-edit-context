@@ -559,9 +559,8 @@ const scripts: Record<string, ScriptStep[]> = {
 		record,
 	],
 	"record-tool-descriptions": [
-		(messages, context) => {
-			// Pi 1.4 passes tools beside the messages; Pi 1.5 declares them in system messages.
-			const tools = [...(context.tools ?? []), ...messages.flatMap((message) => (message.role === "system" ? (message.toolsAdded ?? []) : []))];
+		(messages) => {
+			const tools = messages.flatMap((message) => (message.role === "system" ? (message.toolsAdded ?? []) : []));
 			appendFileSync(logPath, JSON.stringify(tools.map(({ name, description }) => ({ name, description }))) + "\n");
 			return fauxAssistantMessage("done");
 		},
