@@ -730,15 +730,25 @@ function operationLabel(operation: Operation): string {
 	return `${operation.replacement === null ? "remove" : "replace"} ${operation.id}`;
 }
 
-/** Tokens each operation frees when applied alone, so the agent can judge which ones are worth their cache cost. */
+/**
+ * Tokens each operation frees when applied alone, so the agent can judge which ones are worth their cache cost. An operation
+ * that is valid only after the ones before it, such as editing an entry an earlier one restores, is measured after them.
+ */
 function operationBreakdown(sessionManager: ReadonlySessionManager, queued: Draft[], base: SessionProjection, operations: Operation[], model: CurrentModel): string {
 	if (operations.length < 2) return "";
 	const before = totalTokens(base, model);
-	const parts = operations.map((operation) => {
-		const alone = projectWithEdits(sessionManager, [...queued, ...compileOperations(base, [operation])]);
-		return `${operationLabel(operation)} ~${formatTokens(before - totalTokens(alone, model))}`;
+	const frees = (batch: Operation[]): number => before - totalTokens(projectWithEdits(sessionManager, [...queued, ...compileOperations(base, batch)]), model);
+	const DEPENDENT = "after the operations before it";
+	const parts = operations.map((operation, index) => {
+		try {
+			return `${operationLabel(operation)} ~${formatTokens(frees([operation]))}`;
+		} catch {
+			const earlier = operations.slice(0, index);
+			return `${operationLabel(operation)} ~${formatTokens(frees([...earlier, operation]) - frees(earlier))} ${DEPENDENT}`;
+		}
 	});
-	return ` Per operation, each measured alone: ${parts.join("; ")}.`;
+	const measured = parts.some((part) => part.endsWith(DEPENDENT)) ? `each measured alone unless marked ${DEPENDENT}` : "each measured alone";
+	return ` Per operation, ${measured}: ${parts.join("; ")}.`;
 }
 
 const contextOutlineTool = defineTool({

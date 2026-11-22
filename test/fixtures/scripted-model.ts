@@ -588,8 +588,9 @@ const monkeyActs = Number(process.env.SCRIPTED_MODEL_ACTS ?? 40);
  * A plan script, from $SCRIPTED_MODEL_PLAN: "read" steps make reads; then one outline names them, and each {ops} step sends
  * edit_context with symbols resolved: @U is the user message, @A1… the reads in order, @R1… their results, @O the outline's entry. The symbol table
  * is saved to $SCRIPTED_MODEL_SYMBOLS, and a run that opens the same session later loads it instead of outlining again.
+ * An {applyLastPlan} step applies the plan ID the previous step's dry run returned.
  */
-function planSteps(plan: ("read" | { ops: object[]; dryRun?: boolean })[]): ScriptStep[] {
+function planSteps(plan: ("read" | { ops: object[]; dryRun?: boolean } | { applyLastPlan: true })[]): ScriptStep[] {
 	const symbolsPath = process.env.SCRIPTED_MODEL_SYMBOLS!;
 	const symbols: Record<string, string> = existsSync(symbolsPath) ? JSON.parse(readFileSync(symbolsPath, "utf8")) : {};
 	const learnSymbols = (outlineText: string): void => {
@@ -609,6 +610,10 @@ function planSteps(plan: ("read" | { ops: object[]; dryRun?: boolean })[]): Scri
 	const editSteps: ScriptStep[] = plan.flatMap((step) => (step === "read" ? [] : [step])).map((step, index) => (messages) => {
 		if (index === 0 && symbols.U === undefined) learnSymbols(lastToolResultText(messages));
 		else recordContext(messages);
+		if ("applyLastPlan" in step) {
+			const planId = lastToolResultText(messages).match(/"apply": "(plan-\d+)"/)?.[1];
+			return planId ? fauxAssistantMessage(fauxToolCall("edit_context", { apply: planId })) : fauxAssistantMessage("NO-PLAN-TO-APPLY");
+		}
 		return fauxAssistantMessage(fauxToolCall("edit_context", { operations: resolve(step.ops), ...(step.dryRun ? { dryRun: true } : {}) }));
 	});
 	const outlineFirst = symbols.U === undefined ? [() => fauxAssistantMessage(fauxToolCall("context_outline", { minTokens: 0 }))] : [];
