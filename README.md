@@ -7,7 +7,7 @@ Lets a Pi agent edit its own context window mid-run, without deleting its sessio
 
 ## Install
 
-Requires Node.js 22.19.0 or newer and Pi. The maintained Pi lines are 1.4.x and 1.5.x.
+Requires Node.js 22.19.0 or newer and Pi. The maintained Pi lines are 1.5.x and 1.6.x.
 
 Install from [GitHub](https://github.com/giladbarnea/pi-self-edit-context):
 
@@ -74,7 +74,7 @@ npm pack --dry-run
 
 `npm test` uses the locally installed Pi CLI and real `pi -p` sessions against a scripted stand-in model. No external model calls occur.
 Each session gets an isolated home and agent directory, with no inherited credentials or extension configuration.
-The locked development version is Pi 1.5.0. CI also installs exact Pi 1.4.0 packages and checks the installed versions before testing.
+The locked development version is Pi 1.5.0. CI also installs exact Pi 1.6.0 packages and checks the installed versions before testing.
 
 The CI workflow runs on pull requests, pushes to `main` and manual dispatch. It uses Node.js 22.19.0 and read-only repository permissions.
 The suite checks that a real Pi start loads the extension from a local path and as Pi's Git install leaves it (`test/live-load.test.mjs`), that the mirrored transform rule agrees with Pi's own on the installed version (`test/is-sent-parity.test.mjs`), restore trails (`test/restore-trails.test.mjs`), next-request edits, dry runs, the meter in edit reports, stretch outlines and their refusals, the small-entry total, the planning guidance in both tool descriptions, saved plans, stable block IDs, call/result pairing, system-entry order, refusals, restores and outline folding.
