@@ -56,7 +56,9 @@ Therefore:
 
 ### Mode `A`
 
-> Search space: the current context window, its first context window, and the handful of the preceding context windows (how much exactly is up to the curator's judgment at the time of search). Lay out the search space flatly before diving in. If the curator can do it all directly within its current context window, it should. If its current context window is not sufficient, fan out to forks (map-reduce) of high-tier AI models with `medium` thinking level to cover the search space. Curator synthesizes.
+> Search space: the active context window, the first window for foundation, and 2–4 windows immediately before the active one, as available. Start with the two most recent preceding windows. Compare each earlier window with the one after it. Repetition favors stopping at two or three. Relevant new or surprising information favors looking one window further back, up to four, if the curator has room.
+>
+> Lay out the search space flatly before diving in. If the curator can do it all directly within its current context window, it should. If its current context window is not sufficient, fan out to forks (map-reduce) of high-tier AI models with `medium` thinking level to cover the search space. Curator synthesizes.
 
 > "High-tier" AI models, as of Nov 2026, are OpenAI’s GPT-6.1 Sol, Anthropic’s Opus 5.5, or equivalents.
 
