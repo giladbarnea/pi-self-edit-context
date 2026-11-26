@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-11-11T21-55
+last_updated: 2026-11-26T15-57
 ---
 # pi-self-edit-context
 
@@ -36,7 +36,13 @@ Both tool descriptions tell the agent to plan the whole reduction from one outli
 
 ## `context_outline`
 
-Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each entry shows its ID, role, time, estimated size and first line. By default, user messages and entries of 2k+ est. tokens are shown in full; each run of smaller entries is one line with its bounds, size and thinking, so the small tail stays visible as a cost. A line under the header totals what the outline collapsed, such as `Small entries (under 2.0k each): 340 entries, ~170.0k, 34% of the context.`; the share is of the whole context's estimate. `{minTokens: 0}` shows every entry, with no total. `{from, to}` lists only the entries from one entry ID to another, such as one run's bounds, at the given `minTokens`; the header still gives the whole context. An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. Sizes count what Pi sends to the session's current model, by the rules of Pi's own message transform (mirrored here, because Pi does not expose it to extensions): a thinking block that another model wrote is dropped before sending, signature included, so it costs 0; a block the current model wrote counts its thinking and signature. An entry's size is the sum of its blocks, so the header total equals the sum of the lines.
+Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each listed entry shows its ID, role, time and estimated size. Non-user text is a first-line preview.
+
+User messages are always listed and keep their line breaks. Up to 4,000 UTF-16 code units, their text appears in full. Longer messages show the head, the tail and how much was omitted. Follow the link in the outline to the omitted text: when `from` and `to` name the same user entry, the outline shows one page of up to 4,000 code units from `userTextOffset` (default `0`). Each page links to the next if there is more to read.
+
+Other entries of 2k+ est. tokens are listed individually by default. Each run of smaller entries is one line with its bounds, size and thinking. A line under the header totals what the outline collapsed, such as `Small entries (under 2.0k each): 340 entries, ~170.0k, 34% of the context.`; the share is of the whole context's estimate. `{minTokens: 0}` lists every entry, with no total. `{from, to}` lists only the entries from one entry ID to another, such as one run's bounds, at the given `minTokens`; the header still gives the whole context.
+
+An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. Sizes count what Pi sends to the session's current model, by the rules of Pi's own message transform (mirrored here, because Pi does not expose it to extensions): a thinking block that another model wrote is dropped before sending, signature included, so it costs 0; a block the current model wrote counts its thinking and signature. An entry's size is the sum of its blocks, so the header total equals the sum of the lines.
 
 ## `edit_context`
 

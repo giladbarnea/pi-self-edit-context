@@ -29,6 +29,7 @@ type Operation =
 
 const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", "compactionSummary"]);
 const PREVIEW_CHARACTERS = 200;
+const USER_TEXT_LIMIT = 4000;
 const DEFAULT_MIN_TOKENS = 2000;
 const OUTLINE_TOOL = "context_outline";
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
@@ -189,10 +190,39 @@ function pairResults(entries: ProjectedEntry[]): Map<Block, ProjectedEntry> {
 	return resultByCall;
 }
 
-/** @example labelled("a1b2c3d4 user, 11-05 22:00, ~5 tokens", "hi\nthere") === "a1b2c3d4 user, 11-05 22:00, ~5 tokens: hi" */
+/** @example labelled("a1b2c3d4 result, 11-05 22:00, ~5 est.", "hi\nthere") === "a1b2c3d4 result, 11-05 22:00, ~5 est.: hi" */
 function labelled(head: string, text: string): string {
 	const preview = previewOf(text);
 	return preview ? `${head}: ${preview}` : head;
+}
+
+/** @example quoteUserText("one\ntwo") === "one\n  | two" */
+function quoteUserText(text: string): string {
+	return text.replaceAll("\n", "\n  | ");
+}
+
+/** @example boundaryBefore("a🙂b", 2) === 1 */
+function boundaryBefore(text: string, offset: number): number {
+	return offset > 0 && (text.codePointAt(offset - 1) ?? 0) > 0xffff ? offset - 1 : offset;
+}
+
+/** @example userOutlineText("a\nb", "abcd1234", 0) === "a\n  | b" */
+function userOutlineText(text: string, id: string, offset: number | undefined): string {
+	const readFrom = (start: number): string => `context_outline {"from": ${JSON.stringify(id)}, "to": ${JSON.stringify(id)}, "userTextOffset": ${start}}`;
+	if (offset !== undefined) {
+		if (offset > text.length) throw new Error(`userTextOffset exceeds the length of this user message (${text.length} UTF-16 code units)`);
+		const start = boundaryBefore(text, offset);
+		const end = boundaryBefore(text, Math.min(start + USER_TEXT_LIMIT, text.length));
+		const next = end < text.length ? `\n  [More user text: ${readFrom(end)}]` : "";
+		return quoteUserText(text.slice(start, end)) + next;
+	}
+	if (text.length <= USER_TEXT_LIMIT) return quoteUserText(text);
+	const half = USER_TEXT_LIMIT / 2;
+	const headEnd = boundaryBefore(text, half);
+	const tailBoundary = text.length - half;
+	const tailStart = boundaryBefore(text, tailBoundary) === tailBoundary ? tailBoundary : tailBoundary + 1;
+	const elided = tailStart - headEnd;
+	return `${quoteUserText(text.slice(0, headEnd))}\n  [${elided} UTF-16 code unit${elided === 1 ? "" : "s"} elided; read from here: ${readFrom(headEnd)}]\n  | ${quoteUserText(text.slice(tailStart))}`;
 }
 
 function entryHead(entry: ProjectedEntry, label: string, model: CurrentModel): string {
@@ -220,14 +250,18 @@ const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use
 type OutlineUnit = { entry: ProjectedEntry; lines: string[]; entries: number; tokens: number; thinkingTokens: number; anchor: boolean };
 /** A stretch of the outline to show alone, from one entry ID to another, inclusive. */
 type Stretch = { from: string; to: string };
+type OutlineStretch = Stretch & { userTextOffset?: number };
 
 /** One entry as bullets: an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
-function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel): OutlineUnit {
+function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel, focusedUser: OutlineStretch | undefined): OutlineUnit {
 	const message = entry.messages.at(-1)!;
+	if (focusedUser?.userTextOffset !== undefined && message.role !== "user") throw new Error("userTextOffset requires a user entry");
 	if (message.role !== "assistant") {
 		const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
-		const line = `- ${labelled(entryHead(entry, label, model), textOf(message.content))}`;
-		return { entry, lines: [line], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: message.role === "user" };
+		const head = entryHead(entry, label, model);
+		const text = textOf(message.content);
+		const rendered = message.role === "user" ? userOutlineText(text, entry.sourceEntry.id, focusedUser ? focusedUser.userTextOffset ?? 0 : undefined) : previewOf(text);
+		return { entry, lines: [`- ${head}${rendered ? `: ${rendered}` : ""}`], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: message.role === "user" };
 	}
 	const unit: OutlineUnit = { entry, lines: [`- ${entryHead(entry, "assistant", model)}`], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: false };
 	const ids = blockIdsOf(entry);
@@ -274,14 +308,15 @@ function stretchOf(units: OutlineUnit[], { from, to }: Stretch): OutlineUnit[] {
 }
 
 /**
- * Entries of at least minTokens, and user messages, in full; each run of smaller entries as one line with its bounds and size.
+ * List user messages and entries of at least minTokens; collapse each run of other entries into one line.
  * With a stretch, only its entries are listed; the header still gives the whole context.
  */
-function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel, stretch: Stretch | undefined): string {
+function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel, stretch: OutlineStretch | undefined): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
-	const units = visible.filter((entry) => !nestedResults.has(entry)).map((entry) => outlineUnit(entry, resultByCall, model));
+	const focus = stretch?.from === stretch?.to ? stretch : undefined;
+	const units = visible.filter((entry) => !nestedResults.has(entry)).map((entry) => outlineUnit(entry, resultByCall, model, entry.sourceEntry.id === focus?.from ? focus : undefined));
 	const shown = stretch ? stretchOf(units, stretch) : units;
 	const total = totalTokens(projection, model);
 	const body: string[] = [];
@@ -755,22 +790,26 @@ const contextOutlineTool = defineTool({
 	name: "context_outline",
 	label: "Context Outline",
 	description: [
-		"Outline your current context window. The header gives the real context size from Pi's usage meter; each entry is a bullet with its ID, role, time, estimated size, and the first line of its text.",
+		"Outline your current context window. The header gives the real context size from Pi's usage meter; each listed entry gives its ID, role, time and estimated size. Non-user text is a first-line preview.",
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
-		`By default, user messages and entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are shown in full, and each run of smaller entries is one line with its bounds, size and thinking; set minTokens to change the threshold, 0 for every entry.`,
-		"With from and to, only the entries from one entry ID to another are listed, such as one run's bounds with minTokens 0, while the header still gives the whole context.",
+		`User messages are always listed and keep their line breaks. Up to ${USER_TEXT_LIMIT} UTF-16 code units their text is shown in full; longer messages show a head, a tail and a link to the omitted text.`,
+		`By default, other entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are listed individually; each run of smaller entries is one line with its bounds, size and thinking. Set minTokens to change the threshold, 0 to list every entry.`,
+		`With from and to, only that stretch is listed; the header still gives the whole context. Set both to the same user entry ID to read a page of up to ${USER_TEXT_LIMIT} UTF-16 code units from userTextOffset (default 0). Follow a page's link to read more.`,
 		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines after its earliest change.",
 	].join(" "),
 	parameters: Type.Object({
 		removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })),
-		minTokens: Type.Optional(Type.Number({ description: `Show entries of at least this many estimated tokens in full; default ${DEFAULT_MIN_TOKENS}, 0 for all` })),
+		minTokens: Type.Optional(Type.Number({ description: `List non-user entries of at least this many estimated tokens individually; default ${DEFAULT_MIN_TOKENS}, 0 for all` })),
 		from: Type.Optional(Type.String({ description: "First entry ID of a stretch to outline alone, such as a collapsed run's first bound; used with to" })),
 		to: Type.Optional(Type.String({ description: "Last entry ID of the stretch, inclusive; used with from" })),
+		userTextOffset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based UTF-16 offset for a user-text page; requires from and to set to the same user entry ID" })),
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
-		if ((parameters.from === undefined) !== (parameters.to === undefined)) throw new Error("from and to go together: give both, such as a collapsed run's bounds");
-		const stretch = parameters.from === undefined ? undefined : { from: parameters.from, to: parameters.to! };
+		const { from, to, userTextOffset } = parameters;
+		if ((from === undefined) !== (to === undefined)) throw new Error("from and to go together: give both, such as a collapsed run's bounds");
+		if (userTextOffset !== undefined && (from === undefined || from !== to || parameters.removed)) throw new Error("userTextOffset requires from and to set to the same user entry ID in the current outline");
+		const stretch = from === undefined ? undefined : { from, to: to!, userTextOffset };
 		const projection = ctx.sessionManager.buildSessionProjection();
 		const text = parameters.removed ? removedOutlineOf(projection, ctx.model) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS, ctx.model, stretch);
 		return { content: [{ type: "text" as const, text }] };

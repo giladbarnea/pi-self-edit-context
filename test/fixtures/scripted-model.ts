@@ -343,6 +343,31 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
+	"user-outline-pages": [
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const broad = lastToolResultText(messages);
+			const user = outlineId(broad, "user", "Start of paste");
+			const [read] = assistantEntryIds(broad);
+			return fauxAssistantMessage([
+				fauxToolCall("context_outline", { from: user, to: read, minTokens: 0 }),
+				fauxToolCall("context_outline", { from: user, to: read, userTextOffset: 1 }),
+			]);
+		},
+		(messages) => {
+			const [broad] = messages.filter((message) => message.role === "toolResult" && message.toolName === "context_outline");
+			const text = broad.content[0].text as string;
+			const user = outlineId(text, "user", "Start of paste");
+			return fauxAssistantMessage(fauxToolCall("context_outline", JSON.parse(text.match(/context_outline (\{"from": [^\n]+?\})/)?.[1] ?? JSON.stringify({ from: user, to: user }))));
+		},
+		(messages) => {
+			const next = lastToolResultText(messages).match(/context_outline (\{"from": [^\n]+?\})/)?.[1];
+			if (next) return fauxAssistantMessage(fauxToolCall("context_outline", JSON.parse(next)));
+			return record(messages, undefined);
+		},
+		record,
+	],
 	"default-outline": [
 		() => fauxAssistantMessage([signedThinking("THINK-A"), readNull()]),
 		() => fauxAssistantMessage(readNull()),
