@@ -33,6 +33,9 @@ const USER_TEXT_LIMIT = 4000;
 const USER_SAMPLE_WEIGHTS = [3, 2, 1, 2, 3] as const;
 const DEFAULT_MIN_TOKENS = 2000;
 const OUTLINE_TOOL = "context_outline";
+const READ_TOOL = "context_read";
+/** The first line of a context_read page: its message, inclusive character range and total. */
+const READ_HEADER = /^Message (\S+) — characters (\d+)–(\d+) of \d+/;
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
 /** What an entry holds when edits remove every block in it, since Pi cannot send an empty message. */
 const EMPTIED_TEXT = "[content removed]";
@@ -212,7 +215,7 @@ type TextSpan = { start: number; end: number };
 
 // Weighted line segments, candidate order and partial-line cuts adapted from
 // giladbarnea/pi-output-data-toolkit@fb04ce04e6e52fe24a2b57765f678888bc300928:src/smart-truncation.ts (MIT).
-// Use UTF-16 units to match outline paging rather than Toolkit's UTF-8 bytes.
+// Budget UTF-16 units, the preview's length, rather than Toolkit's UTF-8 bytes; gaps name context_read's code-point offsets.
 /** @example userSampleSegments(1) returns [{start: 0, end: 1, weight: 11}] */
 function userSampleSegments(lineCount: number): UserSampleSegment[] {
 	const segments: UserSampleSegment[] = [];
@@ -244,15 +247,20 @@ function* sampleLineOrder({ start, end }: TextSpan, direction: "first" | "last" 
 	}
 }
 
-/** @example sampleUserText("abc…".repeat(1200), String) starts and ends with excerpts separated by an omission marker. */
-function sampleUserText(text: string, readFrom: (offset: number) => string): string {
+/** @example characterCount("a🙂b") === 3 */
+function characterCount(text: string): number {
+	return [...text].length;
+}
+
+/** @example sampleUserText("abc…".repeat(1200), "abcd1234") starts and ends with excerpts separated by gaps that name their characters. */
+function sampleUserText(text: string, id: string): string {
 	const lineOffsets = [0, ...Array.from(text.matchAll(/\n/g), (match) => match.index + 1), text.length];
 	const segments = userSampleSegments(lineOffsets.length - 1);
 	const totalWeight = USER_SAMPLE_WEIGHTS.reduce((sum, weight) => sum + weight, 0);
-	const gapMarker = (size: number): string => `\n  [${size} UTF-16 code units elided]\n  | `;
-	const continuation = (offset: number): string => `\n  [Read from the first omission: ${readFrom(offset)}]`;
+	const gapMarker = (start: number, end: number): string =>
+		`\n  [characters ${start}–${end} omitted; read them with ${READ_TOOL} {"id": ${JSON.stringify(id)}, "offset": ${start}}]\n  | `;
 	// Each segment can omit one gap inside its last line; each boundary can omit one between segments.
-	const budget = USER_TEXT_LIMIT - (2 * segments.length - 1) * gapMarker(text.length).length - continuation(text.length).length;
+	const budget = USER_TEXT_LIMIT - (2 * segments.length - 1) * gapMarker(text.length, text.length).length;
 	const spans: TextSpan[] = [];
 	segments.forEach((segment, index) => {
 		let remaining = Math.floor(budget * segment.weight / totalWeight);
@@ -278,28 +286,32 @@ function sampleUserText(text: string, readFrom: (offset: number) => string): str
 		}
 	});
 	let cursor = 0;
-	let firstOmission: number | undefined;
 	const excerpts = spans.sort((left, right) => left.start - right.start).map(({ start, end }) => {
-		const gap = start - cursor;
-		if (gap > 0) firstOmission ??= cursor;
+		const gap = start > cursor ? gapMarker(characterCount(text.slice(0, cursor)), characterCount(text.slice(0, start)) - 1) : "";
 		cursor = end;
-		return (gap > 0 ? gapMarker(gap) : "") + quoteUserText(text.slice(start, end));
+		return gap + quoteUserText(text.slice(start, end));
 	});
-	return excerpts.join("") + continuation(firstOmission!);
+	return excerpts.join("");
 }
 
-/** @example userOutlineText("a\nb", "abcd1234", 0) === "a\n  | b" */
-function userOutlineText(text: string, id: string, offset: number | undefined): string {
-	const readFrom = (start: number): string => `context_outline {"from": ${JSON.stringify(id)}, "to": ${JSON.stringify(id)}, "userTextOffset": ${start}}`;
-	if (offset !== undefined) {
-		if (offset > text.length) throw new Error(`userTextOffset exceeds the length of this user message (${text.length} UTF-16 code units)`);
-		const start = boundaryBefore(text, offset);
-		const end = boundaryBefore(text, Math.min(start + USER_TEXT_LIMIT, text.length));
-		const next = end < text.length ? `\n  [More user text: ${readFrom(end)}]` : "";
-		return quoteUserText(text.slice(start, end)) + next;
-	}
-	if (text.length <= USER_TEXT_LIMIT) return quoteUserText(text);
-	return sampleUserText(text, readFrom);
+/** @example userOutlineText("a\nb", "abcd1234") === "a\n  | b" */
+function userOutlineText(text: string, id: string): string {
+	return text.length <= USER_TEXT_LIMIT ? quoteUserText(text) : sampleUserText(text, id);
+}
+
+/** One exact page of a current user message's text, counted in Unicode code points. Throws for anything else or an offset outside its text. */
+function userTextPage(projection: SessionProjection, id: string, offset: number): string {
+	if (removedEntries(projection).some(({ sourceEntry }) => sourceEntry.id === id)) throw new Error(`${id} is removed by edits; restore it to read it`);
+	const entry = visibleEntries(projection).find(({ sourceEntry }) => sourceEntry.id === id);
+	if (!entry) throw new Error(`${id} is not an entry in your current context; use a user-message ID from context_outline`);
+	const message = entry.messages.at(-1)!;
+	if (message.role !== "user") throw new Error(`${id} is not a user message (its role is ${message.role}); ${READ_TOOL} reads user messages only`);
+	const characters = [...textOf(message.content)];
+	if (!Number.isInteger(offset)) throw new Error(`Offset ${offset} is not a whole number of characters`);
+	if (offset >= characters.length) throw new Error(`Offset ${offset} is outside message ${id}, which has ${characters.length} characters`);
+	const end = Math.min(offset + USER_TEXT_LIMIT, characters.length);
+	const next = end < characters.length ? `\nNext offset: ${end}` : "";
+	return `Message ${id} — characters ${offset}–${end - 1} of ${characters.length}${next}\n\n${characters.slice(offset, end).join("")}`;
 }
 
 function entryHead(entry: ProjectedEntry, label: string, model: CurrentModel): string {
@@ -327,17 +339,15 @@ const ESTIMATE_NOTE = "Sizes below are estimates at ~4 characters per token; use
 type OutlineUnit = { entry: ProjectedEntry; lines: string[]; entries: number; tokens: number; thinkingTokens: number; anchor: boolean };
 /** A stretch of the outline to show alone, from one entry ID to another, inclusive. */
 type Stretch = { from: string; to: string };
-type OutlineStretch = Stretch & { userTextOffset?: number };
 
 /** One entry as bullets: an assistant entry's blocks nest under it with their own IDs, and each tool result nests under its call. */
-function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel, focusedUser: OutlineStretch | undefined): OutlineUnit {
+function outlineUnit(entry: ProjectedEntry, resultByCall: Map<Block, ProjectedEntry>, model: CurrentModel): OutlineUnit {
 	const message = entry.messages.at(-1)!;
-	if (focusedUser?.userTextOffset !== undefined && message.role !== "user") throw new Error("userTextOffset requires a user entry");
 	if (message.role !== "assistant") {
 		const label = message.role === "toolResult" ? "result (its call is not in context)" : message.role;
 		const head = entryHead(entry, label, model);
 		const text = textOf(message.content);
-		const rendered = message.role === "user" ? userOutlineText(text, entry.sourceEntry.id, focusedUser ? focusedUser.userTextOffset ?? 0 : undefined) : previewOf(text);
+		const rendered = message.role === "user" ? userOutlineText(text, entry.sourceEntry.id) : previewOf(text);
 		return { entry, lines: [`- ${head}${rendered ? `: ${rendered}` : ""}`], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: message.role === "user" };
 	}
 	const unit: OutlineUnit = { entry, lines: [`- ${entryHead(entry, "assistant", model)}`], entries: 1, tokens: entryTokens(entry, model), thinkingTokens: 0, anchor: false };
@@ -388,12 +398,11 @@ function stretchOf(units: OutlineUnit[], { from, to }: Stretch): OutlineUnit[] {
  * List user messages and entries of at least minTokens; collapse each run of other entries into one line.
  * With a stretch, only its entries are listed; the header still gives the whole context.
  */
-function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel, stretch: OutlineStretch | undefined): string {
+function outlineOf(projection: SessionProjection, usage: ContextUsage, minTokens: number, model: CurrentModel, stretch: Stretch | undefined): string {
 	const visible = visibleEntries(projection);
 	const resultByCall = pairResults(visible);
 	const nestedResults = new Set(resultByCall.values());
-	const focus = stretch?.from === stretch?.to ? stretch : undefined;
-	const units = visible.filter((entry) => !nestedResults.has(entry)).map((entry) => outlineUnit(entry, resultByCall, model, entry.sourceEntry.id === focus?.from ? focus : undefined));
+	const units = visible.filter((entry) => !nestedResults.has(entry)).map((entry) => outlineUnit(entry, resultByCall, model));
 	const shown = stretch ? stretchOf(units, stretch) : units;
 	const total = totalTokens(projection, model);
 	const body: string[] = [];
@@ -701,22 +710,35 @@ function earliestChange(base: SessionProjection, drafts: Draft[]): { id: string;
 	return { id: base.entries[index].sourceEntry.id, position: visibleEntries({ ...base, entries: base.entries.slice(0, index) }).length };
 }
 
-type OutlineCall = { entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number; stretch: Stretch | undefined };
+/** The kinds of earlier calls edit_context folds automatically, in the order its report names them. */
+const FOLD_KINDS = ["outline", "read"] as const;
+type FoldKind = (typeof FOLD_KINDS)[number];
+const FOLD_KIND_BY_TOOL = new Map<string, FoldKind>([[OUTLINE_TOOL, "outline"], [READ_TOOL, "read"]]);
+type FoldableCall = { kind: FoldKind; entry: ProjectedEntry; blockId: string; result: ProjectedEntry; position: number; stretch: Stretch | undefined };
 
-/** Earlier context_outline calls with their results, excluding the agent's current message. */
-function outlineCalls(base: SessionProjection): OutlineCall[] {
+/** Earlier outline calls, and read calls that returned a page, with their results, outlines first; excludes the agent's current message. */
+function foldableCalls(base: SessionProjection): FoldableCall[] {
 	const visible = visibleEntries(base);
 	const resultByCall = pairResults(visible);
 	const latestAssistant = visible.findLast((entry) => entry.messages.at(-1)!.role === "assistant");
-	return visible.flatMap((entry, position) => {
+	const calls = visible.flatMap((entry, position) => {
 		if (entry === latestAssistant || entry.messages.at(-1)!.role !== "assistant") return [];
 		const ids = blockIdsOf(entry);
-		return (entry.messages.at(-1)!.content as Block[]).flatMap((block, index) => {
-			const result = block.type === "toolCall" && block.name === OUTLINE_TOOL ? resultByCall.get(block) : undefined;
+		return (entry.messages.at(-1)!.content as Block[]).flatMap((block, index): FoldableCall[] => {
+			const kind = block.type === "toolCall" ? FOLD_KIND_BY_TOOL.get(block.name) : undefined;
+			const result = kind ? resultByCall.get(block) : undefined;
+			if (!kind || !result || (kind === "read" && !READ_HEADER.test(textOf(result.messages.at(-1)!.content)))) return [];
 			const stretch = block.arguments?.from === undefined ? undefined : { from: block.arguments.from, to: block.arguments.to };
-			return result ? [{ entry, blockId: ids[index], result, position, stretch }] : [];
+			return [{ kind, entry, blockId: ids[index], result, position, stretch }];
 		});
 	});
+	return calls.sort((left, right) => FOLD_KINDS.indexOf(left.kind) - FOLD_KINDS.indexOf(right.kind));
+}
+
+/** The short note a folded read leaves: the message and characters it read, and how to get them back. */
+function foldedReadNote(read: FoldableCall): string {
+	const [, id, start, end] = textOf(read.result.messages.at(-1)!.content).match(READ_HEADER)!;
+	return `[Read message ${id}, characters ${start}–${end}. {"restore": "${read.entry.sourceEntry.id}"} brings it back.]`;
 }
 
 /**
@@ -743,7 +765,7 @@ function stretchEntryIds(base: SessionProjection, { from, to }: Stretch): Set<st
  * Entries an outline listed that are removed once the batch applies: those whose latest removal came after the outline was taken.
  * Entries already removed when it was taken are not in it; other outlines' results have notes of their own. A stretch outline lists only its stretch.
  */
-function removedSinceOutline(base: SessionProjection, batch: Draft[], outline: OutlineCall): SessionEntry[] {
+function removedSinceOutline(base: SessionProjection, batch: Draft[], outline: FoldableCall): SessionEntry[] {
 	const outlineIndex = base.entries.indexOf(outline.result);
 	const listed = outline.stretch ? stretchEntryIds(base, outline.stretch) : new Set(base.entries.slice(0, outlineIndex).map(({ sourceEntry }) => sourceEntry.id));
 	const latestEdit = new Map<string, { index: number; replacement: ContextEditEntry["replacement"] }>();
@@ -762,7 +784,7 @@ function removedSinceOutline(base: SessionProjection, batch: Draft[], outline: O
 }
 
 /** The note a folded outline leaves: what it showed, which of its entries are removed, and how to get it back. */
-function foldedOutlineNote(base: SessionProjection, batch: Draft[], outline: OutlineCall, model: CurrentModel): string {
+function foldedOutlineNote(base: SessionProjection, batch: Draft[], outline: FoldableCall, model: CurrentModel): string {
 	const taken = outline.result.sourceEntry.timestamp.slice(11, 16);
 	const summary = outlineSummary(textOf(outline.result.messages.at(-1)!.content));
 	const removed = removedSinceOutline(base, batch, outline);
@@ -774,16 +796,16 @@ function foldedOutlineNote(base: SessionProjection, batch: Draft[], outline: Out
 }
 
 /**
- * Fold the earlier outlines that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
- * Outlines before the earliest change are left, since folding them would move the cache break earlier. So is an outline whose fold
+ * Fold the earlier outlines and reads that sit after the batch's earliest change: they lose the prompt cache anyway, so folding them is free.
+ * Those before the earliest change are left, since folding them would move the cache break earlier. So is one whose fold
  * would put a system entry right after an assistant message, which Anthropic rejects; `project` builds the context drafts would give.
  */
-function withOutlineFolds(base: SessionProjection, operations: Operation[], drafts: Draft[], model: CurrentModel, project: (drafts: Draft[]) => SessionProjection): { drafts: Draft[]; note: string } {
+function withAutomaticFolds(base: SessionProjection, operations: Operation[], drafts: Draft[], model: CurrentModel, project: (drafts: Draft[]) => SessionProjection): { drafts: Draft[]; note: string } {
 	if (editsOf(drafts).length === 0) return { drafts, note: "" };
 	const earliest = earliestChange(base, drafts).position;
 	const targeted = new Set(editsOf(drafts).map(({ targetId }) => targetId));
-	// An outline the batch already changes, such as one it restores, is the agent's own choice; leave it.
-	const calls = outlineCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id) && !targeted.has(call.entry.sourceEntry.id));
+	// A call the batch already changes, such as one it restores, is the agent's own choice; leave it.
+	const calls = foldableCalls(base).filter((call) => !targeted.has(call.result.sourceEntry.id) && !targeted.has(call.entry.sourceEntry.id));
 	const after = calls.filter((call) => call.position > earliest);
 	const left = calls.filter((call) => call.position <= earliest);
 	const orderProblems = (candidate: Draft[]): Set<string> => new Set(systemOrderProblems(replayedOf(project(candidate))).map(({ system }) => system));
@@ -798,14 +820,18 @@ function withOutlineFolds(base: SessionProjection, operations: Operation[], draf
 	});
 	const folded = after.filter((_call, index) => misplaced[index] === undefined);
 	const skippedNote = after
-		.flatMap((call, index) => (misplaced[index] === undefined ? [] : [` Left in place, because folding it would put system entry ${misplaced[index]} right after an assistant message: outline ${call.blockId}.`]))
+		.flatMap((call, index) => (misplaced[index] === undefined ? [] : [` Left in place, because folding it would put system entry ${misplaced[index]} right after an assistant message: ${call.kind} ${call.blockId}.`]))
 		.join("");
 	const leftNote = left.length === 0
 		? ""
-		: ` Left in place, before the earliest change: ${left.map((call) => `outline ${call.blockId} (~${formatTokens(entryTokens(call.result, model))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
+		: ` Left in place, before the earliest change: ${left.map((call) => `${call.kind} ${call.blockId} (~${formatTokens(entryTokens(call.result, model))} est.)`).join(", ")}; folding one would move the cache break back to it.`;
 	if (folded.length === 0) return { drafts, note: leftNote + skippedNote };
-	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: foldedOutlineNote(base, drafts, call, model) }));
-	const foldedNote = ` Also folds ${folded.length} earlier outline${folded.length === 1 ? "" : "s"} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
+	const folds: Operation[] = folded.map((call) => ({ fold: call.blockId, note: call.kind === "read" ? foldedReadNote(call) : foldedOutlineNote(base, drafts, call, model) }));
+	const counts = FOLD_KINDS.flatMap((kind) => {
+		const count = folded.filter((call) => call.kind === kind).length;
+		return count === 0 ? [] : [`${count} earlier ${kind}${count === 1 ? "" : "s"}`];
+	});
+	const foldedNote = ` Also folds ${counts.join(" and ")} after the earliest change (${folded.map((call) => call.blockId).join(", ")}), at no extra cache cost; each leaves a note on how to restore it.`;
 	return { drafts: compileOperations(base, [...operations, ...folds]), note: foldedNote + leftNote + skippedNote };
 }
 
@@ -870,26 +896,42 @@ const contextOutlineTool = defineTool({
 		"Outline your current context window. The header gives the real context size from Pi's usage meter; each listed entry gives its ID, role, time and estimated size. Non-user text is a first-line preview.",
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
-		`User messages are always listed and keep their line breaks. Up to ${USER_TEXT_LIMIT} UTF-16 code units their text is shown in full; longer messages show sampled excerpts, marked gaps and a link to start reading the omitted text.`,
+		`User messages are always listed and keep their line breaks. Up to ${USER_TEXT_LIMIT} UTF-16 code units their text is shown in full; longer messages show sampled excerpts, and each gap names the ${READ_TOOL} call that reads from its start.`,
 		`By default, other entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are listed individually; each run of smaller entries is one line with its bounds, size and thinking. Set minTokens to change the threshold, 0 to list every entry.`,
-		`With from and to, only that stretch is listed; the header still gives the whole context. Set both to the same user entry ID to read a page of up to ${USER_TEXT_LIMIT} UTF-16 code units from userTextOffset (default 0). Follow a page's link to read more.`,
-		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines after its earliest change.",
+		"With from and to, only the entries from one entry ID to another are listed, such as one run's bounds with minTokens 0, while the header still gives the whole context.",
+		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines and reads after its earliest change.",
 	].join(" "),
 	parameters: Type.Object({
 		removed: Type.Optional(Type.Boolean({ description: "List the entries removed by edits instead of the outline" })),
 		minTokens: Type.Optional(Type.Number({ description: `List non-user entries of at least this many estimated tokens individually; default ${DEFAULT_MIN_TOKENS}, 0 for all` })),
 		from: Type.Optional(Type.String({ description: "First entry ID of a stretch to outline alone, such as a collapsed run's first bound; used with to" })),
 		to: Type.Optional(Type.String({ description: "Last entry ID of the stretch, inclusive; used with from" })),
-		userTextOffset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based UTF-16 offset for a user-text page; requires from and to set to the same user entry ID" })),
 	}),
 	async execute(_toolCallId, parameters, _signal, _onUpdate, ctx) {
-		const { from, to, userTextOffset } = parameters;
-		if ((from === undefined) !== (to === undefined)) throw new Error("from and to go together: give both, such as a collapsed run's bounds");
-		if (userTextOffset !== undefined && (from === undefined || from !== to || parameters.removed)) throw new Error("userTextOffset requires from and to set to the same user entry ID in the current outline");
-		const stretch = from === undefined ? undefined : { from, to: to!, userTextOffset };
+		if ((parameters.from === undefined) !== (parameters.to === undefined)) throw new Error("from and to go together: give both, such as a collapsed run's bounds");
+		const stretch = parameters.from === undefined ? undefined : { from: parameters.from, to: parameters.to! };
 		const projection = ctx.sessionManager.buildSessionProjection();
 		const text = parameters.removed ? removedOutlineOf(projection, ctx.model) : outlineOf(projection, ctx.getContextUsage(), parameters.minTokens ?? DEFAULT_MIN_TOKENS, ctx.model, stretch);
 		return { content: [{ type: "text" as const, text }] };
+	},
+});
+
+const contextReadTool = defineTool({
+	name: READ_TOOL,
+	label: "Context Read",
+	description: [
+		`Read the exact text of a user message in your current context, up to ${USER_TEXT_LIMIT} characters (Unicode code points) per call.`,
+		"Give a user-message ID from context_outline and a zero-based offset, such as the start a sampled gap names; offset defaults to 0.",
+		"Each page gives the message ID, its inclusive character range and the total, then the next offset while text remains.",
+		"edit_context folds earlier reads after its earliest change.",
+	].join(" "),
+	parameters: Type.Object({
+		id: Type.String({ description: "A user-message entry ID from context_outline" }),
+		// A number, not an integer: Pi's validator would round a fractional offset instead of refusing it.
+		offset: Type.Optional(Type.Number({ minimum: 0, description: "Zero-based whole character offset to read from; default 0" })),
+	}),
+	async execute(_toolCallId, { id, offset }, _signal, _onUpdate, ctx) {
+		return { content: [{ type: "text" as const, text: userTextPage(ctx.sessionManager.buildSessionProjection(), id, offset ?? 0) }] };
 	},
 });
 
@@ -949,7 +991,7 @@ const editContextTool = defineTool({
 			if (!parameters.operations) throw new Error("Give operations, or apply a plan ID from a dry run");
 			const operations = parameters.operations as Operation[];
 			const project = (candidate: Draft[]): SessionProjection => projectWithEdits(sessionManager, [...queued, ...candidate]);
-			({ drafts, note: outlineNote } = withOutlineFolds(base, operations, compileOperations(base, operations), ctx.model, project));
+			({ drafts, note: outlineNote } = withAutomaticFolds(base, operations, compileOperations(base, operations), ctx.model, project));
 			breakdown = operationBreakdown(sessionManager, queued, base, operations, ctx.model);
 		}
 
@@ -980,6 +1022,7 @@ const editContextTool = defineTool({
 
 export default function selfEditContext(pi: ExtensionAPI): void {
 	pi.registerTool(contextOutlineTool);
+	pi.registerTool(contextReadTool);
 	pi.registerTool(editContextTool);
 	pi.on("turn_end", (event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();

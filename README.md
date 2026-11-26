@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-11-26T16-17
+last_updated: 2026-11-27T01-55
 ---
 # pi-self-edit-context
 
@@ -27,7 +27,7 @@ Restart Pi or run `/reload`. To try it for one session without installing:
 pi -e ./index.ts
 ```
 
-Ask the agent to inspect its context with `context_outline`, then use `edit_context` to replace, fold or restore entries.
+Ask the agent to inspect its context with `context_outline`, read a long user message with `context_read`, then use `edit_context` to replace, fold or restore entries.
 These are agent tools, not slash commands. No API key or additional model is needed by the extension itself.
 
 Edits change future model requests, not the stored originals. This is not a way to erase secrets from session files.
@@ -38,11 +38,24 @@ Both tool descriptions tell the agent to plan the whole reduction from one outli
 
 Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each listed entry shows its ID, role, time and estimated size. Non-user text is a first-line preview.
 
-User messages are always listed and keep their line breaks. Up to 4,000 UTF-16 code units, their text appears in full. Longer messages show excerpts sampled across their lines, with the omitted sizes marked. A single long line shows both ends. The 4,000-unit preview cap includes these markers and the link to the first omission. When `from` and `to` name the same user entry, the outline shows one exact page of up to 4,000 code units from `userTextOffset` (default `0`). Each page links to the next if there is more to read.
+User messages are always listed and keep their line breaks. Up to 4,000 UTF-16 code units, their text appears in full. Longer messages show excerpts sampled across their lines. A single long line shows both ends. Each gap names the characters it omits and the `context_read` call that reads from its start, such as `[characters 2048–6047 omitted; read them with context_read {"id": "abc12345", "offset": 2048}]`. The 4,000-unit preview cap includes these markers.
 
 Other entries of 2k+ est. tokens are listed individually by default. Each run of smaller entries is one line with its bounds, size and thinking. A line under the header totals what the outline collapsed, such as `Small entries (under 2.0k each): 340 entries, ~170.0k, 34% of the context.`; the share is of the whole context's estimate. `{minTokens: 0}` lists every entry, with no total. `{from, to}` lists only the entries from one entry ID to another, such as one run's bounds, at the given `minTokens`; the header still gives the whole context.
 
 An assistant entry's blocks nest under it with their own IDs: `.t0` thinking, `.x0` text, `.c0` call. Each tool result nests under its call. Block IDs come from the entry's original content, so they stay the same across edits; text an edit inserted gets a note ID (`.n0`). Edited entries are marked `edited`, the header counts removed entries, and `{removed: true}` lists them. Sizes count what Pi sends to the session's current model, by the rules of Pi's own message transform (mirrored here, because Pi does not expose it to extensions): a thinking block that another model wrote is dropped before sending, signature included, so it costs 0; a block the current model wrote counts its thinking and signature. An entry's size is the sum of its blocks, so the header total equals the sum of the lines.
+
+## `context_read`
+
+`{id, offset?}` returns an exact page of a current user message: at most 4,000 characters (Unicode code points), from `offset` (zero-based, default `0`). The page starts with the message ID, the inclusive range and the total, then the next offset while text remains, a blank line, and the text:
+
+```text
+Message abc12345 — characters 2048–6047 of 12000
+Next offset: 6048
+
+…
+```
+
+Offsets that are not whole numbers or fall outside the text are refused, as are IDs of entries that are not user messages, are removed by edits, or are not in the context.
 
 ## `edit_context`
 
@@ -62,9 +75,9 @@ Every report, dry run or not, gives Pi's usage meter (a dry run's "Context now",
 
 Edits are refused, and change nothing, naming the entry or block at fault, if they would leave a call without its result or the reverse, make the context start with a non-user message, put a Pi system entry (a prompt or tool-set update) between two assistant messages with no user message or tool result between them, or touch the agent's current message. Pi sends such a system entry right after the first assistant message, and Anthropic rejects that request. Starting a range at a user message avoids it, because the user message then holds the note.
 
-## Outlines fold themselves
+## Outlines and reads fold themselves
 
-When edits apply, earlier `context_outline` results after the batch's earliest change are folded in the same batch. They lose the prompt cache anyway, so this costs nothing. Outlines before the earliest change are left, and the report names them, since folding one would move the cache break earlier. An outline is also left when folding it would put a Pi system entry right after an assistant message, which Anthropic rejects; this happens when something changed the tool set after that outline, with no call in its message. The report names it and the system entry. Each folded outline leaves a note: when it was taken and what it showed, including its stretch, which of the entries it lists are now removed (counted from the session, so the note stays accurate when an outline is restored and folded again), and `{"restore": entryId}` to bring it back. Restoring it shows what the agent saw and the IDs it needs to restore the removed entries themselves.
+When edits apply, earlier `context_outline` results, and `context_read` pages, after the batch's earliest change are folded in the same batch. They lose the prompt cache anyway, so this costs nothing. Those before the earliest change are left, and the report names them, since folding one would move the cache break earlier. An outline is also left when folding it would put a Pi system entry right after an assistant message, which Anthropic rejects; this happens when something changed the tool set after that outline, with no call in its message. The report names it and the system entry. Each folded outline leaves a note: when it was taken and what it showed, including its stretch, which of the entries it lists are now removed (counted from the session, so the note stays accurate when an outline is restored and folded again), and `{"restore": entryId}` to bring it back. Restoring it shows what the agent saw and the IDs it needs to restore the removed entries themselves. A folded read leaves a short note, such as `[Read message abc12345, characters 2048–6047. {"restore": "def67890"} brings it back.]`. Refused reads are not folded.
 
 ## How it works
 
@@ -83,7 +96,7 @@ Each session gets an isolated home and agent directory, with no inherited creden
 The locked development version is Pi 1.5.0. CI also installs exact Pi 1.6.0 packages and checks the installed versions before testing.
 
 The CI workflow runs on pull requests, pushes to `main` and manual dispatch. It uses Node.js 22.19.0 and read-only repository permissions.
-The suite checks that a real Pi start loads the extension from a local path and as Pi's Git install leaves it (`test/live-load.test.mjs`), that the mirrored transform rule agrees with Pi's own on the installed version (`test/is-sent-parity.test.mjs`), restore trails (`test/restore-trails.test.mjs`), next-request edits, dry runs, the meter in edit reports, stretch outlines and their refusals, the small-entry total, the planning guidance in both tool descriptions, saved plans, stable block IDs, call/result pairing, system-entry order, refusals, restores and outline folding.
+The suite checks that a real Pi start loads the extension from a local path and as Pi's Git install leaves it (`test/live-load.test.mjs`), that the mirrored transform rule agrees with Pi's own on the installed version (`test/is-sent-parity.test.mjs`), restore trails (`test/restore-trails.test.mjs`), next-request edits, dry runs, the meter in edit reports, stretch outlines and their refusals, sampled user-message gaps, exact `context_read` pages and refusals, the small-entry total, the planning guidance in both tool descriptions, saved plans, stable block IDs, call/result pairing, system-entry order, refusals, restores, and outline and read folding.
 It also opens a synthetic session that switched from GPT to another model and checks that the estimates ignore the GPT signatures Pi drops, while the same model posing as GPT still counts them.
 It also previews the package contents. CI does not publish packages or make model requests.
 

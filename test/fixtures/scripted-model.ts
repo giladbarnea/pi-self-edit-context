@@ -343,7 +343,7 @@ const scripts: Record<string, ScriptStep[]> = {
 		},
 		record,
 	],
-	"user-outline-pages": [
+	"user-outline-gaps": [
 		() => fauxAssistantMessage(readNull()),
 		outline,
 		(messages) => {
@@ -351,20 +351,76 @@ const scripts: Record<string, ScriptStep[]> = {
 			const user = outlineId(broad, "user", "Start of paste");
 			const [read] = assistantEntryIds(broad);
 			return fauxAssistantMessage([
+				fauxToolCall("context_outline", { from: user, to: user }),
 				fauxToolCall("context_outline", { from: user, to: read, minTokens: 0 }),
-				fauxToolCall("context_outline", { from: user, to: read, userTextOffset: 1 }),
+				fauxToolCall("context_read", JSON.parse(broad.match(/context_read (\{[^\n]+?\})\]/)?.[1] ?? JSON.stringify({ id: user }))),
+			]);
+		},
+		record,
+	],
+	"context-read-short": [
+		outline,
+		(messages) => fauxAssistantMessage(fauxToolCall("context_read", { id: outlineId(lastToolResultText(messages), "user", "") })),
+		record,
+	],
+	// A1 reads a file; then the agent reads the user message: one refused call per invalid target or offset, a removed entry, and every page from the start.
+	"context-read-pages": [
+		() => fauxAssistantMessage(readNull()),
+		outline,
+		(messages) => {
+			const text = lastToolResultText(messages);
+			const user = outlineId(text, "user", "");
+			const [read] = assistantEntryIds(text);
+			return fauxAssistantMessage([
+				fauxToolCall("context_read", { id: user, offset: 100_000_000 }),
+				fauxToolCall("context_read", { id: user, offset: -1 }),
+				fauxToolCall("context_read", { id: user, offset: 1.5 }),
+				fauxToolCall("context_read", { id: read }),
+				fauxToolCall("context_read", { id: resultIdOfCall(text, `${read}.c0`) }),
+				fauxToolCall("context_read", { id: "0000beef" }),
 			]);
 		},
 		(messages) => {
-			const [broad] = messages.filter((message) => message.role === "toolResult" && message.toolName === "context_outline");
-			const text = broad.content[0].text as string;
-			const user = outlineId(text, "user", "Start of paste");
-			return fauxAssistantMessage(fauxToolCall("context_outline", JSON.parse(text.match(/context_outline (\{"from": [^\n]+?\})/)?.[1] ?? JSON.stringify({ from: user, to: user }))));
+			const text = messages.find((message) => message.role === "toolResult" && message.toolName === "context_outline").content[0].text as string;
+			const [read] = assistantEntryIds(text);
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ foldRange: { from: read, to: resultIdOfCall(text, `${read}.c0`), note: "RANGE-NOTE" } }] }));
 		},
 		(messages) => {
-			const next = lastToolResultText(messages).match(/context_outline (\{"from": [^\n]+?\})/)?.[1];
-			if (next) return fauxAssistantMessage(fauxToolCall("context_outline", JSON.parse(next)));
-			return record(messages, undefined);
+			// The fold also folded the outline, so take the IDs from the agent's own calls.
+			const calls = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).filter((block) => block.type === "toolCall");
+			const range = calls.find((block) => block.name === "edit_context").arguments.operations[0].foldRange;
+			return fauxAssistantMessage([
+				fauxToolCall("context_read", { id: range.to }),
+				fauxToolCall("context_read", { id: calls.find((block) => block.name === "context_read").arguments.id }),
+			]);
+		},
+		...Array.from({ length: 4 }, (): ScriptStep => (messages) => {
+			const page = lastToolResultText(messages);
+			const next = page.match(/^Next offset: (\d+)$/m);
+			if (!next) return record(messages, undefined);
+			return fauxAssistantMessage(fauxToolCall("context_read", { id: page.match(/^Message (\S+) /)![1], offset: Number(next[1]) }));
+		}),
+		record,
+	],
+	// O1 outlines, E reads the user message, A3 reads a file, L reads the user message again; then the agent folds A3's read,
+	// so L's read sits after the earliest change and E's before it; last, the agent restores L's read from its note.
+	"context-read-folds": [
+		outline,
+		(messages) => fauxAssistantMessage(fauxToolCall("context_read", { id: outlineId(lastToolResultText(messages), "user", "") })),
+		() => fauxAssistantMessage(readNull()),
+		(messages) => {
+			const text = messages.find((message) => message.role === "toolResult" && message.toolName === "context_outline").content[0].text as string;
+			return fauxAssistantMessage(fauxToolCall("context_read", { id: outlineId(text, "user", ""), offset: 5 }));
+		},
+		outline,
+		(messages) => {
+			const [, , read] = assistantEntryIds(lastToolResultText(messages));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [{ fold: `${read}.c0`, note: "READ-NOTE" }] }));
+		},
+		(messages) => {
+			recordContext(messages);
+			const note = messages.flatMap((message) => (message.role === "assistant" ? message.content : [])).find((block) => block.text?.startsWith("[Read message"));
+			return fauxAssistantMessage(fauxToolCall("edit_context", { operations: [JSON.parse(note?.text.match(/\{"restore": "\w+"\}/)?.[0] ?? "{}")] }));
 		},
 		record,
 	],
@@ -586,7 +642,7 @@ const scripts: Record<string, ScriptStep[]> = {
 	"record-tool-descriptions": [
 		(messages) => {
 			const tools = messages.flatMap((message) => (message.role === "system" ? (message.toolsAdded ?? []) : []));
-			appendFileSync(logPath, JSON.stringify(tools.map(({ name, description }) => ({ name, description }))) + "\n");
+			appendFileSync(logPath, JSON.stringify(tools.map(({ name, description, parameters }) => ({ name, description, parameters }))) + "\n");
 			return fauxAssistantMessage("done");
 		},
 	],

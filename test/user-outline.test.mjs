@@ -17,6 +17,9 @@ test("the user outline keeps a whole line longer than 200 characters", () => {
 	assert.ok(userOutline(prompt).includes(prompt), "the whole sentence should appear without an ellipsis");
 });
 
+/** A sampled gap: its inclusive character range and the context_read call that reads from its start. */
+const GAP = /\n  \[characters (\d+)–(\d+) omitted; read them with context_read \{"id": "(\w+)", "offset": (\d+)\}\]\n  \| /;
+
 function userPreview(outline) {
 	const preview = outline.match(/^- \S+ user, [^\n]*? est\.(?:, edited)?: ([^\n]*(?:\n  [^\n]*)*)/m)?.[1];
 	assert.notEqual(preview, undefined, "outline should have a user entry with text");
@@ -26,7 +29,7 @@ function userPreview(outline) {
 test("a user message exactly at the 4,000-unit cap is shown in full, but one unit more is elided", () => {
 	const prompt = `Start${"x".repeat(3993)}🙂`;
 	assert.ok(userOutline(prompt).includes(prompt), "text at the cap should appear in full, including the last emoji");
-	assert.match(userOutline(`${prompt}!`), /UTF-16 code units elided/, "the cap should apply immediately above 4,000 units");
+	assert.match(userOutline(`${prompt}!`), GAP, "the cap should apply immediately above 4,000 units");
 });
 
 test("a long paste keeps excerpts throughout the message within the rendered preview cap", () => {
@@ -36,7 +39,7 @@ test("a long paste keeps excerpts throughout the message within the rendered pre
 		assert.ok(preview.includes(lines[line - 1]), `the preview should include a full line around position ${line}`);
 	}
 	assert.doesNotMatch(preview, /LINE-015:/, "intervals between excerpts should be omitted");
-	assert.match(preview, /\[\d+ UTF-16 code units elided\]/, "the gaps should be marked");
+	assert.match(preview, GAP, "the gaps should be marked");
 	assert.ok(preview.length <= 4000, `preview including markers and line prefixes is ${preview.length} units`);
 });
 
@@ -53,41 +56,45 @@ test("a large single line keeps both ends and no split emoji, including at its t
 	assert.match(preview, /🙂 End/);
 	assert.ok(preview.isWellFormed(), "the sampled cuts must not split emoji");
 	assert.ok(preview.length <= 4000, `preview including markers is ${preview.length} units`);
-	assert.match(preview, /\[\d+ UTF-16 code units elided\]/);
+	assert.match(preview, GAP);
 });
 
-test("broad outlines bound large user pastes, and their links page through the omitted text", () => {
-	const head = `Start of paste\n${"H".repeat(1984)}`;
-	const middle = `🙂\nMIDDLE\n${"m".repeat(3989)}`;
-	const tail = `${"T".repeat(1986)}\nEnd of paste`;
-	const prompt = head + middle + "🙂" + tail;
-	const { contextAfterEdit, entries } = runAgent("user-outline-pages", prompt);
-	const [broad, stretch, refused, firstPage, lastPage] = contextAfterEdit.filter((message) => message.role === "toolResult" && message.toolName === "context_outline");
+test("every sampled gap names its exact start in the reader's characters, and its call reads from there", () => {
+	const prompt = `Start of paste 🙂🙂🙂\n${"H".repeat(1984)}🙂\nMIDDLE\n${"m".repeat(3989)}🙂${"T".repeat(1986)}\nEnd of paste`;
+	const characters = [...prompt];
+	const { contextAfterEdit, entries } = runAgent("user-outline-gaps", prompt);
+	const [broad, sameUser, stretch] = contextAfterEdit.filter((message) => message.role === "toolResult" && message.toolName === "context_outline");
+	const page = contextAfterEdit.find((message) => message.role === "toolResult" && message.toolName === "context_read");
 	const user = entries.find((entry) => entry.message?.role === "user").id;
 	const read = entries.find((entry) => entry.message?.role === "assistant").id;
 	const result = entries.find((entry) => entry.message?.toolName === "read").id;
-	const linkedOffset = (preview) => Number(preview.match(new RegExp(`context_outline \\{"from": "${user}", "to": "${user}", "userTextOffset": (\\d+)\\}`))?.[1]);
-	const unquote = (text) => text.replaceAll("\n  | ", "\n");
 	const sampled = userPreview(broad.content[0].text);
+	assert.equal(userPreview(sameUser.content[0].text), sampled, "from and to on one user entry select that entry, with the same preview");
 	assert.equal(userPreview(stretch.content[0].text), sampled, "a multi-entry stretch must keep the same capped preview");
-	assert.match(sampled, /^Start of paste\n  \| /);
+	assert.match(sampled, /^Start of paste 🙂🙂🙂\n  \| /);
 	assert.match(sampled, /^  \| End of paste$/m);
 	assert.ok(sampled.length <= 4000 && sampled.isWellFormed(), "the oversized multiline preview should be bounded and Unicode-safe");
-	const prefix = unquote(sampled.split(/\n  \[\d+ UTF-16 code units elided\]/)[0]);
-	assert.equal(linkedOffset(sampled), prefix.length, "the link must start at the first omitted character");
+
+	const pieces = sampled.split(GAP);
+	const gaps = [];
+	let cursor = 0;
+	for (let index = 0; index < pieces.length; index += 5) {
+		const excerpt = [...pieces[index].replaceAll("\n  | ", "\n")];
+		assert.equal(excerpt.join(""), characters.slice(cursor, cursor + excerpt.length).join(""), `the excerpt at character ${cursor} should be the message's own text`);
+		cursor += excerpt.length;
+		if (index + 1 >= pieces.length) break;
+		const [start, end, id, offset] = pieces.slice(index + 1, index + 5);
+		assert.deepEqual({ start: Number(start), id, offset: Number(offset) }, { start: cursor, id: user, offset: cursor }, "a gap should start where the excerpt before it ends, and its call should read from there");
+		gaps.push(cursor);
+		cursor = Number(end) + 1;
+	}
+	assert.equal(cursor, characters.length, "the last excerpt should end the message");
+	assert.ok(gaps.length >= 2, `the preview should sample across the message: ${gaps}`);
+
 	const stretchLines = stretch.content[0].text.split("\n");
 	const call = stretchLines.findIndex((line) => line.startsWith(`  - ${read}.c0 call, `));
 	assert.ok(call >= 0 && stretchLines[call + 1]?.startsWith(`    - ${result} result, `), "the read result should still be nested under its call");
-	assert.equal(refused.isError, true, "a text offset must not apply to a multi-entry stretch");
-
-	assert.ok(firstPage && lastPage, "the preview link and its continuation should each return a page");
-	const first = userPreview(firstPage.content[0].text);
-	const firstChunk = unquote(first.split("\n  [More user text:")[0]);
-	const last = userPreview(lastPage.content[0].text);
-	const lastChunk = unquote(last);
-	assert.equal(linkedOffset(first), prefix.length + firstChunk.length, "a continuation must start after the previous page without a gap");
-	assert.ok(firstChunk.length <= 4000 && lastChunk.length <= 4000, "the exact pages must remain bounded");
-	assert.ok(firstChunk.isWellFormed() && lastChunk.isWellFormed(), "exact paging must not split emoji");
-	assert.ok(!last.includes("userTextOffset"), "the last page needs no continuation");
-	assert.equal(prefix + firstChunk + lastChunk, prompt, "the exact pages must recover every unit beyond the retained prefix");
+	const end = Math.min(gaps[0] + 4000, characters.length) - 1;
+	const next = end + 1 < characters.length ? `\nNext offset: ${end + 1}` : "";
+	assert.equal(page?.content[0].text, `Message ${user} — characters ${gaps[0]}–${end} of ${characters.length}${next}\n\n${characters.slice(gaps[0], end + 1).join("")}`, "the first gap's call should read the exact text it skipped");
 });
