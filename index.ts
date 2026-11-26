@@ -30,6 +30,7 @@ type Operation =
 const USER_ROLES = new Set(["user", "custom", "bashExecution", "branchSummary", "compactionSummary"]);
 const PREVIEW_CHARACTERS = 200;
 const USER_TEXT_LIMIT = 4000;
+const USER_SAMPLE_WEIGHTS = [3, 2, 1, 2, 3] as const;
 const DEFAULT_MIN_TOKENS = 2000;
 const OUTLINE_TOOL = "context_outline";
 const BLOCK_KIND_LETTERS: Record<string, string> = { thinking: "t", text: "x", toolCall: "c" };
@@ -206,6 +207,87 @@ function boundaryBefore(text: string, offset: number): number {
 	return offset > 0 && (text.codePointAt(offset - 1) ?? 0) > 0xffff ? offset - 1 : offset;
 }
 
+type UserSampleSegment = { start: number; end: number; weight: number };
+type TextSpan = { start: number; end: number };
+
+// Weighted line segments, candidate order and partial-line cuts adapted from
+// giladbarnea/pi-output-data-toolkit@fb04ce04e6e52fe24a2b57765f678888bc300928:src/smart-truncation.ts (MIT).
+// Use UTF-16 units to match outline paging rather than Toolkit's UTF-8 bytes.
+/** @example userSampleSegments(1) returns [{start: 0, end: 1, weight: 11}] */
+function userSampleSegments(lineCount: number): UserSampleSegment[] {
+	const segments: UserSampleSegment[] = [];
+	USER_SAMPLE_WEIGHTS.forEach((weight, index) => {
+		const start = Math.floor(index * lineCount / USER_SAMPLE_WEIGHTS.length);
+		const end = Math.max(start + 1, Math.floor((index + 1) * lineCount / USER_SAMPLE_WEIGHTS.length));
+		const previous = segments.at(-1);
+		if (previous?.start === start && previous.end === end) previous.weight += weight;
+		else segments.push({ start, end, weight });
+	});
+	return segments;
+}
+
+/** @example [...sampleLineOrder({start: 0, end: 5}, "center")] returns [2, 1, 3, 0, 4] */
+function* sampleLineOrder({ start, end }: TextSpan, direction: "first" | "last" | "center"): Generator<number> {
+	if (direction === "first") {
+		for (let line = start; line < end; line += 1) yield line;
+		return;
+	}
+	if (direction === "last") {
+		for (let line = end - 1; line >= start; line -= 1) yield line;
+		return;
+	}
+	const center = Math.floor((start + end - 1) / 2);
+	yield center;
+	for (let distance = 1; center - distance >= start || center + distance < end; distance += 1) {
+		if (center - distance >= start) yield center - distance;
+		if (center + distance < end) yield center + distance;
+	}
+}
+
+/** @example sampleUserText("abc…".repeat(1200), String) starts and ends with excerpts separated by an omission marker. */
+function sampleUserText(text: string, readFrom: (offset: number) => string): string {
+	const lineOffsets = [0, ...Array.from(text.matchAll(/\n/g), (match) => match.index + 1), text.length];
+	const segments = userSampleSegments(lineOffsets.length - 1);
+	const totalWeight = USER_SAMPLE_WEIGHTS.reduce((sum, weight) => sum + weight, 0);
+	const gapMarker = (size: number): string => `\n  [${size} UTF-16 code units elided]\n  | `;
+	const continuation = (offset: number): string => `\n  [Read from the first omission: ${readFrom(offset)}]`;
+	// Each segment can omit one gap inside its last line; each boundary can omit one between segments.
+	const budget = USER_TEXT_LIMIT - (2 * segments.length - 1) * gapMarker(text.length).length - continuation(text.length).length;
+	const spans: TextSpan[] = [];
+	segments.forEach((segment, index) => {
+		let remaining = Math.floor(budget * segment.weight / totalWeight);
+		const direction = index === 0 ? "first" : index === segments.length - 1 ? "last" : "center";
+		for (const line of sampleLineOrder(segment, direction)) {
+			const start = lineOffsets[line];
+			const end = lineOffsets[line + 1];
+			const quoteCost = line < lineOffsets.length - 2 ? 4 : 0;
+			const cost = end - start + quoteCost;
+			if (cost <= remaining) {
+				if (end > start) spans.push({ start, end });
+				remaining -= cost;
+				continue;
+			}
+			if (remaining >= 128) {
+				const kept = remaining - quoteCost;
+				const headEnd = boundaryBefore(text, start + Math.ceil(kept / 2));
+				const tailBoundary = end - Math.floor(kept / 2);
+				const tailStart = boundaryBefore(text, tailBoundary) === tailBoundary ? tailBoundary : tailBoundary + 1;
+				spans.push({ start, end: headEnd }, { start: tailStart, end });
+			}
+			break;
+		}
+	});
+	let cursor = 0;
+	let firstOmission: number | undefined;
+	const excerpts = spans.sort((left, right) => left.start - right.start).map(({ start, end }) => {
+		const gap = start - cursor;
+		if (gap > 0) firstOmission ??= cursor;
+		cursor = end;
+		return (gap > 0 ? gapMarker(gap) : "") + quoteUserText(text.slice(start, end));
+	});
+	return excerpts.join("") + continuation(firstOmission!);
+}
+
 /** @example userOutlineText("a\nb", "abcd1234", 0) === "a\n  | b" */
 function userOutlineText(text: string, id: string, offset: number | undefined): string {
 	const readFrom = (start: number): string => `context_outline {"from": ${JSON.stringify(id)}, "to": ${JSON.stringify(id)}, "userTextOffset": ${start}}`;
@@ -217,12 +299,7 @@ function userOutlineText(text: string, id: string, offset: number | undefined): 
 		return quoteUserText(text.slice(start, end)) + next;
 	}
 	if (text.length <= USER_TEXT_LIMIT) return quoteUserText(text);
-	const half = USER_TEXT_LIMIT / 2;
-	const headEnd = boundaryBefore(text, half);
-	const tailBoundary = text.length - half;
-	const tailStart = boundaryBefore(text, tailBoundary) === tailBoundary ? tailBoundary : tailBoundary + 1;
-	const elided = tailStart - headEnd;
-	return `${quoteUserText(text.slice(0, headEnd))}\n  [${elided} UTF-16 code unit${elided === 1 ? "" : "s"} elided; read from here: ${readFrom(headEnd)}]\n  | ${quoteUserText(text.slice(tailStart))}`;
+	return sampleUserText(text, readFrom);
 }
 
 function entryHead(entry: ProjectedEntry, label: string, model: CurrentModel): string {
@@ -793,7 +870,7 @@ const contextOutlineTool = defineTool({
 		"Outline your current context window. The header gives the real context size from Pi's usage meter; each listed entry gives its ID, role, time and estimated size. Non-user text is a first-line preview.",
 		"An assistant entry's thinking, text and tool calls are nested under it with block IDs such as df511fce.t0 (thinking), .x0 (text), .c0 (call) and .n0 (a note an edit inserted), and each tool result is nested under its call.",
 		"Block IDs stay the same across edits. Entries changed by an edit are marked edited; {removed: true} lists the entries edits removed, for restore.",
-		`User messages are always listed and keep their line breaks. Up to ${USER_TEXT_LIMIT} UTF-16 code units their text is shown in full; longer messages show a head, a tail and a link to the omitted text.`,
+		`User messages are always listed and keep their line breaks. Up to ${USER_TEXT_LIMIT} UTF-16 code units their text is shown in full; longer messages show sampled excerpts, marked gaps and a link to start reading the omitted text.`,
 		`By default, other entries of ${formatTokens(DEFAULT_MIN_TOKENS)}+ est. tokens are listed individually; each run of smaller entries is one line with its bounds, size and thinking. Set minTokens to change the threshold, 0 to list every entry.`,
 		`With from and to, only that stretch is listed; the header still gives the whole context. Set both to the same user entry ID to read a page of up to ${USER_TEXT_LIMIT} UTF-16 code units from userTextOffset (default 0). Follow a page's link to read more.`,
 		"Take one outline, plan the full set of edits from it, and apply them in a single edit_context call; edit_context folds earlier outlines after its earliest change.",

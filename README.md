@@ -1,5 +1,5 @@
 ---
-last_updated: 2026-11-26T15-57
+last_updated: 2026-11-26T16-17
 ---
 # pi-self-edit-context
 
@@ -38,7 +38,7 @@ Both tool descriptions tell the agent to plan the whole reduction from one outli
 
 Outlines the context as nested bullets. The header gives the real context size from Pi's usage meter (`ctx.getContextUsage()`, the same source as the footer). Per-entry and per-block sizes are estimates at ~4 characters per token, marked `est.`, for comparing entries; Pi has no per-message tokenizer. Each listed entry shows its ID, role, time and estimated size. Non-user text is a first-line preview.
 
-User messages are always listed and keep their line breaks. Up to 4,000 UTF-16 code units, their text appears in full. Longer messages show the head, the tail and how much was omitted. Follow the link in the outline to the omitted text: when `from` and `to` name the same user entry, the outline shows one page of up to 4,000 code units from `userTextOffset` (default `0`). Each page links to the next if there is more to read.
+User messages are always listed and keep their line breaks. Up to 4,000 UTF-16 code units, their text appears in full. Longer messages show excerpts sampled across their lines, with the omitted sizes marked. A single long line shows both ends. The 4,000-unit preview cap includes these markers and the link to the first omission. When `from` and `to` name the same user entry, the outline shows one exact page of up to 4,000 code units from `userTextOffset` (default `0`). Each page links to the next if there is more to read.
 
 Other entries of 2k+ est. tokens are listed individually by default. Each run of smaller entries is one line with its bounds, size and thinking. A line under the header totals what the outline collapsed, such as `Small entries (under 2.0k each): 340 entries, ~170.0k, 34% of the context.`; the share is of the whole context's estimate. `{minTokens: 0}` lists every entry, with no total. `{from, to}` lists only the entries from one entry ID to another, such as one run's bounds, at the given `minTokens`; the header still gives the whole context.
 
