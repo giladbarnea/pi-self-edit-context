@@ -102,7 +102,7 @@ Cases range from accidental context bombs to large payloads that are genuinely m
 
 **4. Unambiguous noise: fold it with a short note**
 
-There is no signal to extract. Leave a note of about ten words that names the folded bout's intent and its outcome. Write each note for what it folds; never reuse one generic note across folds. A toy example: an agent searches many locations for the active configuration file. Once it finds the file, the earlier misses have no bearing on its work. “Search misses before locating the active configuration file.”
+There is no signal to extract. Leave a note of about ten words that names the folded bout's intent and its outcome. A toy example: an agent searches many locations for the active configuration file. Once it finds the file, the earlier misses have no bearing on its work. “Search misses before locating the active configuration file.”
 
 Real world cases are often more grey area, so use common sense.
 
